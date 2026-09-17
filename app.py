@@ -179,7 +179,7 @@ class DatabaseManager:
         for absence in absences_list:
             cursor.execute(
                 "INSERT INTO absences (name, start_week, duration, replacements) VALUES (?, ?, ?, ?)",
-                (absence['name'], absence['weeks'][0], len(absence['weeks']), json.dumps(absence['replacements']))
+                (absence['name'], (absence.get('weeks') or [0])[0], len(absence.get('weeks', [])), json.dumps({'replacements': absence.get('replacements', []), 'dates': absence.get('dates', [])}))
             )
         self.conn.commit()
 
@@ -189,13 +189,18 @@ class DatabaseManager:
         result = []
         for row in cursor.fetchall():
             try:
-                replacements = json.loads(row[4])
+                decoded = json.loads(row[4])
+                if isinstance(decoded, dict):
+                    replacements = decoded.get('replacements', [])
+                    dates = decoded.get('dates', [])
+                else:
+                    replacements, dates = decoded, []
             except Exception:
-                replacements = [row[4]]
+                replacements, dates = [row[4]], []
             result.append({
                 'name': row[1],
-                'weeks': list(range(row[2], row[2] + row[3])),
-                'replacements': replacements
+                'weeks': list(range(row[2], row[2] + row[3])) if row[2] else [],
+                'dates': dates, 'replacements': replacements
             })
         return result
 
@@ -273,16 +278,39 @@ class MinistryScheduler:
         self.schedule_data = {}
         self.gladi_event_counter = 0
 
-        self.max_loads_4_weeks = {
-            "Johanes": 4, "Siska": 3, "Calista": 2,
-            "Yessi": 4, "Isel": 3, "Donny": 3, "Relis": 3, "Nuel": 3,
-            "Pipik": 4, "Andree": 3, "Hartono": 3, "Risma": 3, "Ayu": 3, "Ferry": 3
+        # Baseline volunteer load from the supplied scheduling workbook.
+        self.base_loads = {
+            "Johanes": 4, "Andree": 4, "Pipik": 5, "Yessi": 5,
+            "Isel": 5, "Donny": 4, "Siska": 4, "Hartono": 4,
+            "Relis": 5, "Ferry": 4, "Nuel": 4, "Calista": 4,
+            "Ayu": 4, "Risma": 4,
         }
-        self.max_loads_5_weeks = {
-            "Johanes": 5, "Siska": 4, "Calista": 3,
-            "Yessi": 4, "Isel": 4, "Donny": 4, "Relis": 4, "Nuel": 4,
-            "Pipik": 4, "Andree": 4, "Hartono": 4, "Risma": 4, "Ayu": 4, "Ferry": 4
+        self.max_loads_4_weeks = dict(self.base_loads)
+        self.max_loads_5_weeks = dict(self.base_loads)
+        # Initial team mapping from RANCANGAN JADWAL DM.xlsx.
+        self.teams = {
+            'VOLTAGE': [
+                {'name':'TIM 1','pic':'Johanes','member':'Calista'},
+                {'name':'TIM 2','pic':'Siska','member':'Calista'},
+                {'name':'TIM 3','pic':'Johanes','member':'Siska'},
+            ],
+            'AOG': [
+                {'name':'TIM 1','pic':'Yessi','member':'Nuel'},
+                {'name':'TIM 2','pic':'Isel','member':'Relis'},
+                {'name':'TIM 3','pic':'Donny','member':'Nuel'},
+                {'name':'TIM 4','pic':'Yessi','member':'Relis'},
+                {'name':'TIM 5','pic':'Isel','member':'Donny'},
+            ],
+            'UMUM': [
+                {'name':'TIM 1','pic':'Pipik','member':'Ayu'},
+                {'name':'TIM 2','pic':'Andree','member':'Ferry'},
+                {'name':'TIM 3','pic':'Hartono','member':'Risma'},
+                {'name':'TIM 4','pic':'Siska','member':'Donny'},
+                {'name':'TIM 5','pic':'Pipik','member':'Johanes'},
+                {'name':'TIM 6','pic':'Isel','member':'Yessi'},
+            ],
         }
+
 
         self.month_combo = "September"
         self.year_spin = 2026
@@ -343,7 +371,9 @@ class MinistryScheduler:
             if week_num > 5:
                 week_num = 5
         for absence in self.absences:
-            if person_name == absence['name'] and week_num in absence['weeks']:
+            if person_name == absence['name'] and week_num in absence.get('weeks', []):
+                return True
+            if person_name == absence['name'] and date_str in absence.get('dates', []):
                 return True
         return False
 
@@ -613,6 +643,28 @@ class MinistryScheduler:
         except Exception as e:
             return False, f"Error in Add Absence: {e}"
 
+    def add_date_absence(self, name, selected_dates, replacement):
+        if not name or not selected_dates:
+            return False, "Pilih nama dan minimal satu tanggal izin."
+        if not replacement or replacement == name:
+            return False, "Pilih pengganti yang berbeda dari nama yang izin."
+        try:
+            date_strings = [
+                self.get_indonesian_date(d)
+                for d in selected_dates
+                if isinstance(d, date)
+            ]
+            if not date_strings:
+                return False, "Pilih minimal satu tanggal izin yang valid."
+            for rec in self.absences:
+                if rec.get('name') == name and set(date_strings).intersection(rec.get('dates', [])):
+                    return False, f"{name} sudah memiliki izin pada salah satu tanggal tersebut."
+            self.absences.append({'name':name, 'weeks':[], 'dates':date_strings, 'replacements':[replacement]})
+            self.db.save_absences(self.absences)
+            return True, "Izin tanggal tertentu berhasil ditambahkan."
+        except Exception as e:
+            return False, f"Gagal menyimpan izin tanggal: {e}"
+
     def add_gladi_event(self, event_type, d, time_text, desc, conflict_action=None):
         if not d or not time_text or not desc:
             return 'error', "Please fill all fields."
@@ -734,140 +786,554 @@ class MinistryScheduler:
         try:
             if not self.all_names:
                 raise ValueError("Please complete Setup first.")
+
             num_weeks = 4 if self.weeks_combo == 4 else 5
             max_loads = self.max_loads_5_weeks if num_weeks == 5 else self.max_loads_4_weeks
+
+            # IMPORTANT:
+            # The automatic scheduler works at TEAM level first, not by selecting
+            # PIC and Member independently.  This guarantees that configured teams
+            # are actually rotated during the month.  The PIC/member pair is only
+            # broken when an absence, trainee rule, or manual override requires it.
             current_loads = defaultdict(int)
             for name in self.all_names:
                 current_loads[name] = 0
-            trainee_counts = {t['name']: 0 for t in self.trainees if not t['finished']}
+
+            trainee_counts = {
+                t['name']: 0 for t in self.trainees if not t.get('finished', False)
+            }
+
             self.schedule_data = {
                 w: {svc: {'pic': '', 'member': ''} for svc in self.services}
                 for w in range(1, num_weeks + 1)
             }
+
             month_idx = [
                 'January', 'February', 'March', 'April', 'May', 'June',
                 'July', 'August', 'September', 'October', 'November', 'December'
             ].index(self.month_combo)
 
-            for week in range(1, num_weeks + 1):
+            # Number of times each configured team has been used in this month.
+            team_usage = {
+                group: {idx: 0 for idx in range(len(self.teams.get(group, [])))}
+                for group in self.teams
+            }
+
+            # Keep the combination of teams used by each group in every week.
+            # This is intentionally local to this scheduling run; it does not
+            # change the database or any existing data structure.
+            team_combo_history = {group: [] for group in GROUPS}
+
+            def get_absence_map(week):
                 absent_this_week = {}
                 for abs_rec in self.absences:
-                    if week in abs_rec['weeks']:
+                    if week in abs_rec.get('weeks', []):
                         week_index = abs_rec['weeks'].index(week)
-                        repl_list = abs_rec['replacements']
+                        repl_list = abs_rec.get('replacements', [])
                         if repl_list:
-                            repl = repl_list[week_index % len(repl_list)]
-                            absent_this_week[abs_rec['name']] = repl
+                            absent_this_week[abs_rec['name']] = repl_list[week_index % len(repl_list)]
+                return absent_this_week
 
-                for svc in self.services:
+            def effective_person(person, absent_this_week):
+                return absent_this_week.get(person, person)
+
+            def team_actual_pair(team, absent_this_week):
+                """Return the actual PIC/member after applying absence replacement."""
+                pic = effective_person(team.get('pic', ''), absent_this_week)
+                mem = effective_person(team.get('member', ''), absent_this_week)
+                return pic, mem
+
+            def team_load_score(pic, mem, usage, preferred_order):
+                """Dynamic load score; lower is better."""
+                pic_load = current_loads.get(pic, 0)
+                mem_load = current_loads.get(mem, 0) if mem else 0
+                pic_cap = max_loads.get(pic, num_weeks)
+                mem_cap = max_loads.get(mem, num_weeks) if mem else num_weeks
+
+                projected_pic = pic_load + 1
+                projected_mem = mem_load + (1 if mem and mem != pic else 0)
+
+                # Prefer candidates that stay within their dynamic load limit.
+                overload = max(
+                    0, projected_pic - pic_cap
+                ) + max(
+                    0, projected_mem - mem_cap
+                )
+
+                # Relative load keeps people balanced even before a hard limit.
+                ratio_pic = projected_pic / max(pic_cap, 1)
+                ratio_mem = projected_mem / max(mem_cap, 1) if mem else 0
+                balance = max(ratio_pic, ratio_mem)
+                total = projected_pic + projected_mem
+
+                return (
+                    overload,
+                    balance,
+                    total,
+                    usage,
+                    preferred_order
+                )
+
+            for week in range(1, num_weeks + 1):
+                absent_this_week = get_absence_map(week)
+
+                # Teams already used in this particular week are avoided when
+                # there are enough teams to fill the service slots.
+                used_team_this_week = {group: set() for group in GROUPS}
+                weekly_team_plan = {}
+
+                def build_week_team_plan(group_name, group_services):
+                    """Choose one distinct team per automatic service.
+
+                    The planner evaluates the whole group/week instead of making
+                    three independent greedy choices.  This prevents Umum 1/2/3
+                    from accidentally receiving the same 3-team combination in
+                    different weeks while still using dynamic PIC/member loads.
+                    """
+                    auto_services = []
+                    for s in group_services:
+                        has_pic_override = any(
+                            o['week'] == week and o['service'] == s and o['role'] == 'PIC'
+                            for o in self.manual_overrides
+                        )
+                        has_mem_override = any(
+                            o['week'] == week and o['service'] == s and o['role'] == 'Member'
+                            for o in self.manual_overrides
+                        )
+                        if not has_pic_override and not has_mem_override:
+                            auto_services.append(s)
+
+                    if not auto_services:
+                        return {}
+
+                    valid_teams = []
+                    for idx, team in enumerate(self.teams.get(group_name, [])):
+                        raw_pic = str(team.get('pic', '')).strip()
+                        raw_mem = str(team.get('member', '')).strip()
+                        if not raw_pic or not raw_mem:
+                            continue
+                        pic, mem = team_actual_pair(team, absent_this_week)
+                        if not pic or not mem or pic == mem:
+                            continue
+                        valid_teams.append((idx, team, pic, mem))
+
+                    if not valid_teams:
+                        return {}
+
+                    # Normally the number of teams is >= the number of services
+                    # in a group.  If not, retain the old behavior as closely as
+                    # possible rather than inventing an impossible constraint.
+                    plan_size = min(len(auto_services), len(valid_teams))
+                    service_count = len(auto_services)
+                    history = team_combo_history[group_name]
+
+                    best = None
+
+                    def evaluate_plan(chosen, remaining, pos):
+                        nonlocal best
+                        if pos == plan_size:
+                            # If there are more automatic services than usable
+                            # teams, the remaining services will be handled by the
+                            # existing per-service logic.
+                            selected_indices = tuple(x[0] for x in chosen)
+                            combo = frozenset(selected_indices)
+                            repeated_combo = 1 if combo in history else 0
+
+                            new_team_count = sum(
+                                1 for idx in selected_indices
+                                if team_usage[group_name].get(idx, 0) == 0
+                            )
+
+                            projected = defaultdict(int)
+                            overload = 0
+                            max_ratio = 0.0
+                            total_ratio = 0.0
+                            usage_total = 0
+
+                            for idx, _, pic, mem in chosen:
+                                projected[pic] += 1
+                                if mem and mem != pic:
+                                    projected[mem] += 1
+                                usage_total += team_usage[group_name].get(idx, 0)
+
+                            for person, add in projected.items():
+                                cap = max_loads.get(person, num_weeks)
+                                projected_load = current_loads.get(person, 0) + add
+                                overload += max(0, projected_load - cap)
+                                ratio = projected_load / max(cap, 1)
+                                max_ratio = max(max_ratio, ratio)
+                                total_ratio += ratio
+
+                            # A repeated team combination is a hard-to-break
+                            # penalty.  Monthly coverage comes next, followed by
+                            # dynamic load balancing and finally deterministic
+                            # rotation.
+                            rotation = tuple(
+                                (idx + week + service_pos) % max(len(valid_teams), 1)
+                                for service_pos, (idx, _, _, _) in enumerate(chosen)
+                            )
+                            score = (
+                                repeated_combo,
+                                -new_team_count,
+                                overload,
+                                max_ratio,
+                                total_ratio,
+                                usage_total,
+                                rotation,
+                                selected_indices,
+                            )
+                            if best is None or score < best[0]:
+                                best = (score, dict(zip(auto_services[:plan_size], chosen)))
+                            return
+
+                        # Deterministic exhaustive search is tiny for the current
+                        # application (e.g. 6 teams x 3 Umum slots = 120 orders).
+                        for item in remaining:
+                            next_remaining = [r for r in remaining if r[0] != item[0]]
+                            evaluate_plan(chosen + [item], next_remaining, pos + 1)
+
+                    evaluate_plan([], valid_teams, 0)
+
+                    if best is None:
+                        return {}
+
+                    selected_plan = {}
+                    for svc_name, item in best[1].items():
+                        selected_plan[svc_name] = item[0]
+
+                    selected_combo = frozenset(selected_plan.values())
+                    team_combo_history[group_name].append(selected_combo)
+                    return selected_plan
+
+                for svc_index, svc in enumerate(self.services):
                     group_name = self.service_to_group[svc]
                     group_data = self.groups[group_name]
-                    orig_pics = list(group_data['pics'])
-                    orig_mems = list(group_data['members'])
 
-                    # Unfinished trainees remain visible in the group setup, but
-                    # they must not enter the normal PIC/member rotation. They are
-                    # added explicitly below only for their configured training
-                    # month + service + training count.
                     unfinished_trainees = self._unfinished_trainee_names()
-                    orig_pics = [p for p in orig_pics if p not in unfinished_trainees]
-                    orig_mems = [m for m in orig_mems if m not in unfinished_trainees]
+                    orig_pics = [
+                        p for p in list(group_data.get('pics', []))
+                        if p not in unfinished_trainees
+                    ]
+                    orig_mems = [
+                        m for m in list(group_data.get('members', []))
+                        if m not in unfinished_trainees
+                    ]
 
-                    pic_pool = (
-                        orig_pics[month_idx % len(orig_pics):] + orig_pics[:month_idx % len(orig_pics)]
-                        if orig_pics else []
+                    override_pic = next(
+                        (o['person'] for o in self.manual_overrides
+                         if o['week'] == week and o['service'] == svc and o['role'] == 'PIC'),
+                        None
                     )
-                    mem_pool_base = (
-                        orig_mems[month_idx % len(orig_mems):] + orig_mems[:month_idx % len(orig_mems)]
-                        if orig_mems else []
+                    override_mem = next(
+                        (o['person'] for o in self.manual_overrides
+                         if o['week'] == week and o['service'] == svc and o['role'] == 'Member'),
+                        None
                     )
 
-                    override_pic = next((o['person'] for o in self.manual_overrides
-                                         if o['week'] == week and o['service'] == svc and o['role'] == 'PIC'), None)
-                    override_mem = next((o['person'] for o in self.manual_overrides
-                                         if o['week'] == week and o['service'] == svc and o['role'] == 'Member'), None)
+                    # --------------------------------------------------------
+                    # 1. Manual assignment remains authoritative.
+                    # --------------------------------------------------------
+                    if override_pic or override_mem:
+                        assigned_pic = override_pic or ''
+                        assigned_mem = override_mem or ''
 
-                    if override_pic:
-                        assigned_pic = override_pic
-                    else:
-                        if svc.startswith('Umum'):
-                            pic_pool = [p for p in pic_pool if p not in self.umum_support_pool]
-                        available_pics_with_idx = []
-                        seen_pics = set()
-                        for idx, p in enumerate(pic_pool):
-                            if p not in seen_pics:
-                                actual_p = absent_this_week.get(p, p)
-                                if actual_p not in seen_pics:
-                                    available_pics_with_idx.append((actual_p, idx))
-                                    seen_pics.add(actual_p)
-                        available_pics_with_idx.sort(
-                            key=lambda x: (
-                                current_loads.get(x[0], 0) >= max_loads.get(x[0], num_weeks),
-                                current_loads.get(x[0], 0), x[1]
+                        # If only one role is manually fixed, fill the other role
+                        # from the compatible configured team when possible.
+                        if override_pic and not override_mem:
+                            compatible = []
+                            for idx, team in enumerate(self.teams.get(group_name, [])):
+                                if team.get('pic') == override_pic:
+                                    pic, mem = team_actual_pair(team, absent_this_week)
+                                    if pic == override_pic and mem and mem != override_pic:
+                                        compatible.append((idx, team))
+                            compatible.sort(
+                                key=lambda x: team_load_score(
+                                    x[1].get('pic', ''), x[1].get('member', ''),
+                                    team_usage[group_name].get(x[0], 0), x[0]
+                                )
                             )
+                            if compatible:
+                                assigned_mem = team_actual_pair(compatible[0][1], absent_this_week)[1]
+
+                        elif override_mem and not override_pic:
+                            compatible = []
+                            for idx, team in enumerate(self.teams.get(group_name, [])):
+                                if team.get('member') == override_mem:
+                                    pic, mem = team_actual_pair(team, absent_this_week)
+                                    if pic and mem == override_mem and pic != override_mem:
+                                        compatible.append((idx, team))
+                            compatible.sort(
+                                key=lambda x: team_load_score(
+                                    x[1].get('pic', ''), x[1].get('member', ''),
+                                    team_usage[group_name].get(x[0], 0), x[0]
+                                )
+                            )
+                            if compatible:
+                                assigned_pic = team_actual_pair(compatible[0][1], absent_this_week)[0]
+
+                        # Fall back to the old independent-pool behavior for any
+                        # role that still cannot be resolved.
+                        if not assigned_pic:
+                            pic_candidates = []
+                            for idx, p in enumerate(orig_pics):
+                                actual = effective_person(p, absent_this_week)
+                                if svc.startswith('Umum') and actual in self.umum_support_pool:
+                                    continue
+                                if actual not in {x[0] for x in pic_candidates}:
+                                    pic_candidates.append((actual, idx))
+                            pic_candidates.sort(
+                                key=lambda x: (
+                                    current_loads.get(x[0], 0) >= max_loads.get(x[0], num_weeks),
+                                    current_loads.get(x[0], 0), x[1]
+                                )
+                            )
+                            assigned_pic = pic_candidates[0][0] if pic_candidates else ''
+
+                        if not assigned_mem:
+                            mem_candidates = []
+                            for idx, m in enumerate(orig_mems):
+                                actual = effective_person(m, absent_this_week)
+                                if actual != assigned_pic and actual not in {x[0] for x in mem_candidates}:
+                                    mem_candidates.append((actual, idx))
+                            mem_candidates.sort(
+                                key=lambda x: (
+                                    current_loads.get(x[0], 0) >= max_loads.get(x[0], num_weeks),
+                                    current_loads.get(x[0], 0), x[1]
+                                )
+                            )
+                            assigned_mem = mem_candidates[0][0] if mem_candidates else assigned_pic
+
+                    else:
+                        # ----------------------------------------------------
+                        # 2. Automatic mode: SELECT A CONFIGURED TEAM FIRST.
+                        # ----------------------------------------------------
+                        configured_teams = []
+                        for idx, team in enumerate(self.teams.get(group_name, [])):
+                            raw_pic = str(team.get('pic', '')).strip()
+                            raw_mem = str(team.get('member', '')).strip()
+                            if not raw_pic or not raw_mem:
+                                continue
+
+                            pic, mem = team_actual_pair(team, absent_this_week)
+                            if not pic or not mem or pic == mem:
+                                continue
+
+                            # A configured team is authoritative in automatic
+                            # team-rotation mode. This intentionally allows a
+                            # configured Umum team whose PIC belongs to the support
+                            # pool, because those teams must also rotate and be
+                            # covered during the month.
+
+                            configured_teams.append((idx, team, pic, mem))
+
+                        # If absence replacement makes a team unusable, it is
+                        # skipped rather than generating a duplicate person pair.
+                        available_team_count = len(configured_teams)
+                        avoid_same_week = (
+                            len(self.teams.get(group_name, [])) >=
+                            sum(1 for s in self.services if self.service_to_group[s] == group_name)
                         )
-                        assigned_pic = available_pics_with_idx[0][0] if available_pics_with_idx else ""
 
-                    if override_mem:
-                        assigned_mem = override_mem
-                    else:
-                        available_mems_with_idx = []
-                        seen_mems = set()
-                        for idx, m in enumerate(mem_pool_base):
-                            if m not in seen_mems:
-                                actual_m = absent_this_week.get(m, m)
-                                if actual_m not in seen_mems:
-                                    available_mems_with_idx.append((actual_m, idx))
-                                    seen_mems.add(actual_m)
+                        if configured_teams:
+                            # Build one group-level plan once per week.  For Umum
+                            # this means Umum 1/2/3 are optimized together, so a
+                            # previously used 3-team combination is not selected
+                            # again when another valid combination exists.
+                            if group_name not in weekly_team_plan:
+                                group_services = [
+                                    s for s in self.services
+                                    if self.service_to_group[s] == group_name
+                                ]
+                                weekly_team_plan[group_name] = build_week_team_plan(
+                                    group_name, group_services
+                                )
 
-                        if svc.startswith('Umum'):
-                            umum_pool = self.umum_support_pool
-                            umum_rotated = (
-                                umum_pool[month_idx % len(umum_pool):] + umum_pool[:month_idx % len(umum_pool)]
+                            planned_idx = weekly_team_plan[group_name].get(svc)
+                            if planned_idx is not None:
+                                planned = next(
+                                    (x for x in configured_teams if x[0] == planned_idx),
+                                    None
+                                )
+                                if planned is not None:
+                                    selected_team_idx, _, assigned_pic, assigned_mem = planned
+                                    team_usage[group_name][selected_team_idx] += 1
+                                    used_team_this_week[group_name].add(selected_team_idx)
+                                else:
+                                    planned_idx = None
+
+                            if planned_idx is None:
+                                candidates = []
+                                for idx, team, pic, mem in configured_teams:
+                                    used_count = team_usage[group_name].get(idx, 0)
+                                    used_this_week = idx in used_team_this_week[group_name]
+                                    never_used = used_count == 0
+
+                                    # Strong priority order:
+                                    #   A. every team must get its first assignment
+                                    #   B. do not repeat a team in the same week when possible
+                                    #   C. stay within dynamic load limits
+                                    #   D. balance total load
+                                    #   E. rotate fairly instead of always taking the first team
+                                    coverage_priority = 0 if never_used else 1
+                                    same_week_priority = (1 if used_this_week and avoid_same_week else 0)
+
+                                    load_score = team_load_score(
+                                        pic, mem, used_count, idx
+                                    )
+
+                                    # Give the monthly coverage rule more weight than
+                                    # a small load difference. This is the key fix: a
+                                    # team that has never served this month is selected
+                                    # before an already-used team.
+                                    score = (
+                                        coverage_priority,
+                                        same_week_priority,
+                                        load_score[0],
+                                        load_score[1],
+                                        load_score[2],
+                                        load_score[3],
+                                        (idx + month_idx) % max(len(self.teams.get(group_name, [])), 1)
+                                    )
+                                    candidates.append((score, idx, pic, mem))
+
+                                candidates.sort(key=lambda x: x[0])
+
+                                # When a team is still unused, choose the best unused
+                                # team even if its projected load is slightly higher.
+                                # This is necessary to guarantee monthly team coverage.
+                                unused = [c for c in candidates if team_usage[group_name].get(c[1], 0) == 0]
+                                if unused:
+                                    chosen = unused[0]
+                                else:
+                                    chosen = candidates[0]
+
+                                _, selected_team_idx, assigned_pic, assigned_mem = chosen
+                                team_usage[group_name][selected_team_idx] += 1
+                                used_team_this_week[group_name].add(selected_team_idx)
+
+                        else:
+                            # No valid configured team is available. Preserve a
+                            # safe fallback to the original load-based selection.
+                            pic_candidates = []
+                            for idx, p in enumerate(orig_pics):
+                                actual = effective_person(p, absent_this_week)
+                                if svc.startswith('Umum') and actual in self.umum_support_pool:
+                                    continue
+                                if actual not in {x[0] for x in pic_candidates}:
+                                    pic_candidates.append((actual, idx))
+                            pic_candidates.sort(
+                                key=lambda x: (
+                                    current_loads.get(x[0], 0) >= max_loads.get(x[0], num_weeks),
+                                    current_loads.get(x[0], 0), x[1]
+                                )
                             )
-                            start_idx = len(available_mems_with_idx)
-                            for m in umum_rotated:
-                                actual_m = absent_this_week.get(m, m)
-                                if actual_m not in seen_mems:
-                                    available_mems_with_idx.append((actual_m, start_idx))
-                                    seen_mems.add(actual_m)
-                                    start_idx += 1
+                            assigned_pic = pic_candidates[0][0] if pic_candidates else ''
 
-                        for trainee in self.trainees:
-                            if (trainee['group'] == group_name
-                                    and trainee['month'] == self.month_combo
-                                    and trainee['service'] == svc
-                                    and not trainee.get('finished', False)):
-                                if (trainee_counts.get(trainee['name'], 0) < int(trainee['trainings'])
-                                        and trainee['name'] not in seen_mems):
-                                    available_mems_with_idx.append((trainee['name'], len(available_mems_with_idx)))
-                                    seen_mems.add(trainee['name'])
+                            mem_candidates = []
+                            for idx, m in enumerate(orig_mems):
+                                actual = effective_person(m, absent_this_week)
+                                if actual != assigned_pic and actual not in {x[0] for x in mem_candidates}:
+                                    mem_candidates.append((actual, idx))
+                            mem_candidates.sort(
+                                key=lambda x: (
+                                    current_loads.get(x[0], 0) >= max_loads.get(x[0], num_weeks),
+                                    current_loads.get(x[0], 0), x[1]
+                                )
+                            )
+                            assigned_mem = mem_candidates[0][0] if mem_candidates else assigned_pic
 
-                        available_mems_with_idx = [
-                            (m, idx) for m, idx in available_mems_with_idx if m != assigned_pic
+                    # --------------------------------------------------------
+                    # 3. Trainee rule remains active.
+                    # --------------------------------------------------------
+                    if not override_mem:
+                        due_trainees = [
+                            t for t in self.trainees
+                            if (t.get('group') == group_name
+                                and t.get('month') == self.month_combo
+                                and t.get('service') == svc
+                                and not t.get('finished', False)
+                                and trainee_counts.get(t.get('name'), 0) < int(t.get('trainings', 0))
+                                and t.get('name') != assigned_pic)
                         ]
-                        available_mems_with_idx.sort(
-                            key=lambda x: (
-                                current_loads.get(x[0], 0) >= max_loads.get(x[0], num_weeks),
-                                current_loads.get(x[0], 0), x[1]
+                        if due_trainees:
+                            # Keep the trainee requirement deterministic while
+                            # selecting the trainee with the fewest completed
+                            # training assignments first.
+                            due_trainees.sort(
+                                key=lambda t: (
+                                    trainee_counts.get(t['name'], 0),
+                                    t['name'].casefold()
+                                )
                             )
-                        )
-                        assigned_mem = available_mems_with_idx[0][0] if available_mems_with_idx else assigned_pic
+                            assigned_mem = due_trainees[0]['name']
 
+                    # --------------------------------------------------------
+                    # 4. Update dynamic loads exactly once per actual person.
+                    # --------------------------------------------------------
                     if assigned_pic:
                         current_loads[assigned_pic] += 1
                     if assigned_mem and assigned_mem != assigned_pic:
                         current_loads[assigned_mem] += 1
+
                     if assigned_mem in trainee_counts:
                         trainee_counts[assigned_mem] += 1
                     if assigned_pic in trainee_counts:
                         trainee_counts[assigned_pic] += 1
 
-                    self.schedule_data[week][svc] = {'pic': assigned_pic, 'member': assigned_mem}
+                    self.schedule_data[week][svc] = {
+                        'pic': assigned_pic,
+                        'member': assigned_mem
+                    }
+
+            # ------------------------------------------------------------
+            # FINAL VALIDATION: every configured team must be used at least
+            # once in the generated month whenever there are enough service
+            # slots for that group.
+            # ------------------------------------------------------------
+            validation_errors = []
+            group_slot_counts = {
+                group: sum(
+                    1 for w in range(1, num_weeks + 1)
+                    for svc in self.services
+                    if self.service_to_group[svc] == group
+                )
+                for group in GROUPS
+            }
+
+            for group in GROUPS:
+                valid_teams = [
+                    (idx, team) for idx, team in enumerate(self.teams.get(group, []))
+                    if team.get('pic') and team.get('member')
+                ]
+                if len(valid_teams) <= group_slot_counts[group]:
+                    missing = [
+                        team.get('name', f'TIM {idx + 1}')
+                        for idx, team in valid_teams
+                        if team_usage.get(group, {}).get(idx, 0) == 0
+                    ]
+                    if missing:
+                        validation_errors.append(
+                            f"{group}: team belum terjadwal: {', '.join(missing)}"
+                        )
+
+            # Strict monthly team-coverage validation is applied to a clean
+            # automatic run only. Absence replacements, manual assignments, or
+            # trainee assignments can intentionally break an exact configured
+            # PIC/member pair, so those existing workflows must not be rejected.
+            clean_automatic_run = not self.absences and not self.manual_overrides and not any(
+                not t.get('finished', False) for t in self.trainees
+            )
+            if validation_errors and clean_automatic_run:
+                raise ValueError(
+                    "Automatic team coverage could not be satisfied. "
+                    + " | ".join(validation_errors)
+                )
 
             return True, None
+
         except Exception as e:
             return False, f"An error occurred:\n{str(e)}\n\nDetails:\n{traceback.format_exc()}"
+
 
     # --------------------------------------------------------
     # Excel export - preserves original worksheet structure
@@ -904,8 +1370,8 @@ class MinistryScheduler:
         ws['A2'].alignment = center_align
 
         headers = [
-            "IBADAH", "VOLTAGE (13.00)", "TEENS (16.00)", "YOUTH (18.30)",
-            "UMUM 1 (07.00)", "UMUM 2 (09.30)", "UMUM 3 (17.00)"
+            "IBADAH", "VOLTAGE\n(13.00)", "TEENS\n(16.00)", "YOUTH\n(18.30)",
+            "UMUM 1\n(07.00)", "UMUM 2\n(09.30)", "UMUM 3\n(17.00)"
         ]
         for col, h in enumerate(headers, 1):
             cell = ws.cell(row=4, column=col, value=h)
@@ -938,21 +1404,37 @@ class MinistryScheduler:
 
             ws.cell(row=current_row, column=1, value="Volunteer").border = thin_border
             for col, svc in enumerate(self.services, 2):
-                pic = self.schedule_data[w][svc]['pic']
-                val = f"{pic} (PIC)" if pic else "UNFILLED"
+                assignment = self.schedule_data[w][svc]
+                pic = assignment.get('pic', '')
+                mem = assignment.get('member', '')
+                group_name = self.service_to_group.get(svc, '')
+
+                # Resolve the configured team from its PIC + member pair.
+                # Keep this export change local: all existing team setup data
+                # and the rest of the workbook layout remain untouched.
+                matching_team = next(
+                    (team for team in self.teams.get(group_name, [])
+                     if team.get('pic', '') == pic and team.get('member', '') == mem),
+                    None
+                )
+                if pic:
+                    # Show team name only when the scheduled PIC/member pair
+                    # exactly matches a configured team; otherwise show names only.
+                    team_label = matching_team.get('name', '').strip() if matching_team else ''
+                    people_lines = [pic] + ([mem] if mem else [])
+                    val = "\n".join(([team_label] if team_label else []) + people_lines)
+                else:
+                    val = "UNFILLED"
+
                 cell = ws.cell(row=current_row, column=col, value=val)
                 cell.border = thin_border
+                cell.alignment = center_align
                 if not pic:
                     cell.fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
                     cell.font = XlFont(color="FFFFFF")
             current_row += 1
 
-            ws.cell(row=current_row, column=1, value="").border = thin_border
-            for col, svc in enumerate(self.services, 2):
-                mem = self.schedule_data[w][svc]['member']
-                cell = ws.cell(row=current_row, column=col, value=mem if mem else "")
-                cell.border = thin_border
-            current_row += 1
+            # No separate member row: team, PIC, and member are shown together.
 
             ws.cell(row=current_row, column=1, value="Link Tally dan Seat Counter").border = thin_border
             for col in range(2, 8):
@@ -1231,16 +1713,25 @@ def show_schedule_html():
             f"<td colspan='3' class='schedule-date-sat'>{scheduler.get_indonesian_date(sat)}</td>"
             f"<td colspan='3' class='schedule-date-sun'>{scheduler.get_indonesian_date(sun)}</td></tr>"
         )
-        pic_cells = []
-        mem_cells = []
+        volunteer_cells = []
         for svc in SERVICES:
             data = scheduler.schedule_data[w][svc]
-            pic = data['pic']
-            mem = data['member']
-            pic_cells.append(f"<td class='{'schedule-unfilled' if not pic else ''}'>{(pic + ' (PIC)') if pic else 'UNFILLED'}</td>")
-            mem_cells.append(f"<td>{mem}</td>")
-        rows.append("<tr><td><b>Volunteer</b></td>" + "".join(pic_cells) + "</tr>")
-        rows.append("<tr><td></td>" + "".join(mem_cells) + "</tr>")
+            pic = data.get('pic', '')
+            mem = data.get('member', '')
+            group_name = scheduler.service_to_group.get(svc, '')
+            matching_team = next(
+                (team for team in scheduler.teams.get(group_name, [])
+                 if team.get('pic', '') == pic and team.get('member', '') == mem),
+                None
+            )
+            if pic:
+                team_name = matching_team.get('name', '').strip() if matching_team else ''
+                lines = ([team_name] if team_name else []) + [pic] + ([mem] if mem else [])
+                cell_text = "<br>".join(lines)
+                volunteer_cells.append(f"<td>{cell_text}</td>")
+            else:
+                volunteer_cells.append("<td class='schedule-unfilled'>UNFILLED</td>")
+        rows.append("<tr><td><b>Volunteer</b></td>" + "".join(volunteer_cells) + "</tr>")
         rows.append("<tr><td><b>Link Tally dan Seat Counter</b></td><td colspan='6'></td></tr>")
         rows.append("<tr><td colspan='7' style='height:8px;border:none'></td></tr>")
 
@@ -1536,6 +2027,39 @@ if st.session_state.active_tab == 0:
                             )
                             st.rerun()
 
+    st.subheader("Team Configuration & Preview")
+    st.caption("Nama tim tidak boleh duplikat di dalam kelompok. Pilih PIC dan member dari daftar anggota yang sudah ada.")
+    for group_name in GROUPS:
+        with st.expander(f"{group_name} — Tim", expanded=True):
+            current = scheduler.teams.get(group_name, [])
+            count = st.number_input(f"Jumlah tim {group_name}", min_value=1, max_value=20, value=max(1,len(current)), step=1, key=f"team_count_{group_name}")
+            revised=[]
+            # Daftar pilihan global: seluruh PIC dan member dari semua kelompok.
+            # Nama boleh dipilih berulang di Voltage, AOG, dan Umum; jangan
+            # membatasi pilihan hanya pada anggota kelompok yang sedang diedit.
+            people = sorted({
+                str(name).strip()
+                for group_data in scheduler.groups.values()
+                for name in (group_data.get('members', []) + group_data.get('pics', []))
+                if str(name).strip()
+            }, key=str.casefold)
+            if not people:
+                people = ['']
+            for idx in range(int(count)):
+                old=current[idx] if idx < len(current) else {'name':f'TIM {idx+1}','pic':'','member':''}
+                c1,c2,c3=st.columns([1,2,2])
+                with c1: team_name=st.text_input(f"Nama tim #{idx+1}", value=old.get('name',f'TIM {idx+1}'), key=f"team_name_{group_name}_{idx}")
+                with c2: pic=st.selectbox(f"PIC tim #{idx+1}", people, index=people.index(old['pic']) if old.get('pic') in people else 0, key=f"team_pic_{group_name}_{idx}")
+                with c3: member=st.selectbox(f"Member tim #{idx+1}", people, index=people.index(old['member']) if old.get('member') in people else 0, key=f"team_mem_{group_name}_{idx}")
+                revised.append({'name':team_name.strip(),'pic':pic,'member':member})
+            names=[t['name'].casefold() for t in revised]
+            if any(not n for n in names) or len(names)!=len(set(names)):
+                st.error(f"Nama tim {group_name} kosong atau duplikat. Ubah sebelum menyimpan.")
+            else:
+                scheduler.teams[group_name]=revised
+            import pandas as pd
+            st.dataframe(pd.DataFrame([{t['name']: f"{t['pic']} (PIC)" if row==0 else t['member'] for t in revised} for row in range(2)]), use_container_width=True, hide_index=True)
+
     if st.button("💾 Save Setup & Map Services", type="primary", use_container_width=True):
         groups = {}
         for g in GROUPS:
@@ -1623,6 +2147,31 @@ elif st.session_state.active_tab == 1:
     else:
         replacement_mode = "Same replacement person"
         multiple_replacements = []
+
+    st.markdown("### Izin pada tanggal tertentu")
+    date_abs_name = st.selectbox("Nama yang izin pada tanggal", names if names else [""], key="date_abs_name")
+    selected_dates = st.date_input("Tanggal izin (bisa satu atau beberapa tanggal)", value=[], key="date_abs_dates")
+    date_repl_options=[n for n in names if n != date_abs_name]
+    date_replacement=st.selectbox("Pengganti untuk izin tanggal", date_repl_options if date_repl_options else [""], key="date_abs_replacement")
+    if st.button("➕ Tambah Izin Tanggal", key="add_date_abs", use_container_width=True):
+        # Streamlit date_input can return a date, tuple/list, or an incomplete range.
+        try:
+            if isinstance(selected_dates, date):
+                normalized_dates = [selected_dates]
+            elif isinstance(selected_dates, (list, tuple)):
+                normalized_dates = [d for d in selected_dates if isinstance(d, date)]
+            else:
+                normalized_dates = []
+
+            ok, msg = scheduler.add_date_absence(
+                date_abs_name, normalized_dates, date_replacement
+            )
+            if ok:
+                st.success(msg)
+            else:
+                st.warning(msg)
+        except Exception as e:
+            st.error(f"Gagal menambahkan izin tanggal: {e}")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -1926,32 +2475,98 @@ elif st.session_state.active_tab == 5:
     st.header("6. Manual Assignment")
     names = sorted(scheduler.all_names)
 
+    # Manual assignment can be made either by individual PIC/Member or by
+    # selecting a configured Team.  Team assignment intentionally reuses the
+    # existing manual_overrides structure by creating/updating its PIC and
+    # Member entries.  No database/schema changes are required.
     c1, c2 = st.columns(2)
     with c1:
         override_week = st.number_input("Week", min_value=1, max_value=5, value=1, step=1, key="override_week")
         override_svc = st.selectbox("Service", SERVICES, key="override_svc")
     with c2:
-        override_role = st.selectbox("Role", ["PIC", "Member"], key="override_role")
-        override_person = st.selectbox("Person", names if names else [""], key="override_person")
+        override_role = st.selectbox("Assignment Type", ["PIC", "Member", "Team"], key="override_role")
+
+    selected_group = scheduler.service_to_group.get(override_svc, "")
+    configured_teams = scheduler.teams.get(selected_group, []) if selected_group else []
+    team_options = [t.get('name', '').strip() for t in configured_teams if t.get('name', '').strip()]
+
+    if override_role == "Team":
+        override_team = st.selectbox(
+            f"Team ({selected_group})",
+            team_options if team_options else [""],
+            key="override_team"
+        )
+        override_person = ""
+    else:
+        override_person = st.selectbox(
+            "Person", names if names else [""], key="override_person"
+        )
+        override_team = ""
 
     if st.button("➕ Add Manual Assignment", type="primary", use_container_width=True):
-        result, payload = scheduler.add_override(int(override_week), override_svc, override_role, override_person)
-        if result == 'success':
-            st.success(payload)
-        elif result == 'duplicate':
-            st.session_state.override_pending = {
-                'week': int(override_week), 'svc': override_svc,
-                'role': override_role, 'person': override_person, 'existing': payload
-            }
+        week = int(override_week)
+
+        if override_role != "Team":
+            result, payload = scheduler.add_override(week, override_svc, override_role, override_person)
+            if result == 'success':
+                st.success(payload)
+            elif result == 'duplicate':
+                st.session_state.override_pending = {
+                    'week': week, 'svc': override_svc,
+                    'role': override_role, 'person': override_person, 'existing': payload
+                }
+            else:
+                st.warning(payload)
         else:
-            st.warning(payload)
+            # A Team is stored as the existing PIC + Member override pair so
+            # the current generate_schedule() logic remains untouched.
+            selected_team = next(
+                (t for t in configured_teams if t.get('name', '').strip() == override_team),
+                None
+            )
+            if not selected_team:
+                st.warning(f"Belum ada konfigurasi Team untuk group {selected_group}.")
+            else:
+                team_pic = selected_team.get('pic', '').strip()
+                team_member = selected_team.get('member', '').strip()
+                if not team_pic or not team_member:
+                    st.warning(f"{override_team} belum memiliki PIC dan Member yang lengkap.")
+                elif team_pic == team_member:
+                    st.warning(f"{override_team} tidak dapat digunakan karena PIC dan Member sama.")
+                else:
+                    existing_pic = next(
+                        (o for o in scheduler.manual_overrides
+                         if o['week'] == week and o['service'] == override_svc and o['role'] == 'PIC'),
+                        None
+                    )
+                    existing_mem = next(
+                        (o for o in scheduler.manual_overrides
+                         if o['week'] == week and o['service'] == override_svc and o['role'] == 'Member'),
+                        None
+                    )
+
+                    st.session_state.override_pending = {
+                        'week': week, 'svc': override_svc, 'role': 'Team',
+                        'team': override_team, 'team_pic': team_pic, 'team_member': team_member,
+                        'existing_pic': existing_pic, 'existing_mem': existing_mem
+                    }
 
     if st.session_state.get('override_pending'):
         p = st.session_state.override_pending
-        st.warning(
-            f"An assignment already exists for Week {p['week']}, {p['svc']}, {p['role']}. "
-            f"Current person: {p['existing']['person']}. Update it with {p['person']}?"
-        )
+
+        if p.get('role') == 'Team':
+            st.warning(
+                f"Set Team {p['team']} untuk Week {p['week']} — {p['svc']}? "
+                f"PIC: {p['team_pic']} | Member: {p['team_member']}"
+            )
+            if p.get('existing_pic') or p.get('existing_mem'):
+                st.info("Assignment PIC/Member pada Week dan Service tersebut sudah ada dan akan diperbarui menjadi Team yang dipilih.")
+        else:
+            st.warning(
+                f"An assignment already exists for Week {p['week']}, {p['svc']}, {p['role']}. "
+                f"Current person: {p['existing']['person']}. Update it with {p['person']}?"
+            )
+
         c1, c2 = st.columns(2)
         with c1:
             if st.button("❌ No", key="ov_no", use_container_width=True):
@@ -1959,10 +2574,39 @@ elif st.session_state.active_tab == 5:
                 rerun()
         with c2:
             if st.button("🔄 Yes, Update", key="ov_yes", type="primary", use_container_width=True):
-                scheduler.add_override(p['week'], p['svc'], p['role'], p['person'], conflict_action='update')
-                st.session_state.override_pending = None
-                st.success(f"Updated {p['svc']} {p['role']} for Week {p['week']} to {p['person']}!")
-                rerun()
+                if p.get('role') == 'Team':
+                    # Update existing entries or create missing entries.
+                    pic_result, pic_payload = scheduler.add_override(
+                        p['week'], p['svc'], 'PIC', p['team_pic'],
+                        conflict_action='update'
+                    )
+                    if pic_result == 'success' and not p.get('existing_pic'):
+                        pass
+                    elif pic_result == 'error':
+                        st.session_state.override_pending = None
+                        st.warning(pic_payload)
+                        rerun()
+
+                    mem_result, mem_payload = scheduler.add_override(
+                        p['week'], p['svc'], 'Member', p['team_member'],
+                        conflict_action='update'
+                    )
+                    if mem_result == 'error':
+                        st.session_state.override_pending = None
+                        st.warning(mem_payload)
+                        rerun()
+
+                    st.session_state.override_pending = None
+                    st.success(
+                        f"Team {p['team']} berhasil ditetapkan untuk Week {p['week']} — {p['svc']} "
+                        f"(PIC: {p['team_pic']}, Member: {p['team_member']})."
+                    )
+                    rerun()
+                else:
+                    scheduler.add_override(p['week'], p['svc'], p['role'], p['person'], conflict_action='update')
+                    st.session_state.override_pending = None
+                    st.success(f"Updated {p['svc']} {p['role']} for Week {p['week']} to {p['person']}!")
+                    rerun()
 
     override_table()
 
