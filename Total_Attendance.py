@@ -106,6 +106,16 @@ class DatabaseManager:
             service TEXT,
             finished INTEGER
         )''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS service_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            service TEXT NOT NULL,
+            service_date TEXT NOT NULL,
+            month TEXT NOT NULL,
+            year INTEGER NOT NULL,
+            report_json TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(service, service_date)
+        )''')
         self.conn.commit()
 
     def save_setup(self, groups_data):
@@ -225,6 +235,115 @@ class DatabaseManager:
             for row in cursor.fetchall()
         ]
 
+    # --------------------------------------------------------
+    # Service Report persistence
+    # --------------------------------------------------------
+    def save_service_report(self, report):
+        cursor = self.conn.cursor()
+        service = report['service']
+        service_date = report['service_date']
+        month = report['month']
+        year = int(report['year'])
+
+        # ------------------------------------------------------------
+        # Service Report bersifat ADDITIVE untuk data VOLUNTEER.
+        # Jika laporan pada ibadah + tanggal yang sama sudah ada, data
+        # volunteer lama TIDAK dihapus. Jumlah dari input terbaru
+        # dianggap sebagai tambahan volunteer dan dijumlahkan ke data lama.
+        # Departemen baru juga otomatis ditambahkan ke dictionary lama.
+        # ------------------------------------------------------------
+        cursor.execute(
+            "SELECT report_json FROM service_reports WHERE service = ? AND service_date = ?",
+            (service, service_date)
+        )
+        existing_row = cursor.fetchone()
+
+        if existing_row:
+            try:
+                existing_report = json.loads(existing_row[0])
+            except (TypeError, json.JSONDecodeError):
+                existing_report = {}
+
+            old_volunteers = existing_report.get('volunteers', {}) or {}
+            new_volunteers = report.get('volunteers', {}) or {}
+
+            # Pada revisi, angka yang terlihat di form adalah TOTAL TERKINI
+            # per departemen, bukan angka tambahan. Contoh: data lama S-Pro=4
+            # lalu user mengubah form menjadi 5, hasil akhir harus 5 (bertambah 1),
+            # bukan 9. Departemen lama yang tidak disentuh tetap dipertahankan.
+            merged_volunteers = dict(old_volunteers)
+            for dept, new_count in new_volunteers.items():
+                try:
+                    current_count = int(new_count or 0)
+                except (TypeError, ValueError):
+                    current_count = 0
+                merged_volunteers[dept] = current_count
+
+            # Hapus departemen yang secara eksplisit dikoreksi menjadi 0, tetapi
+            # jangan menghapus departemen lama yang tidak dikirim oleh form.
+            merged_volunteers = {
+                dept: int(count or 0) for dept, count in merged_volunteers.items()
+                if int(count or 0) != 0
+            }
+
+            # Total volunteer dihitung dari data final semua departemen.
+            merged_total_volunteers = sum(
+                int(v or 0) for v in merged_volunteers.values()
+            )
+
+            # Revisi Service Report harus memperbarui DATA TERKINI secara penuh.
+            # Data lama tetap menjadi dasar, tetapi field yang dikirim dari form
+            # (attendance, gembala, pembicara, fulltimer, speaker_name, prayer
+            # corner, dan field laporan lainnya) harus mengikuti input terbaru.
+            # Untuk volunteer, gunakan jumlah TERKINI per departemen hasil form,
+            # bukan menjumlahkan ulang angka lama dengan angka baru.
+            merged_report = dict(existing_report)
+            merged_report.update(report)
+            merged_report['volunteers'] = merged_volunteers
+            merged_report['total_volunteers'] = merged_total_volunteers
+
+            # Total kehadiran keseluruhan selalu dihitung ulang dari DATA TERKINI:
+            # Kehadiran Jemaat Saja + Gembala + Pembicara + Fulltimer + Total Volunteer.
+            merged_report['total_attendance'] = _service_report_total_attendance(merged_report)
+
+            # Metadata mengikuti laporan yang sedang disimpan.
+            merged_report['service'] = service
+            merged_report['service_date'] = service_date
+            merged_report['month'] = month
+            merged_report['year'] = year
+            report = merged_report
+
+        payload = json.dumps(report, ensure_ascii=False)
+        cursor.execute("""
+            INSERT INTO service_reports
+                (service, service_date, month, year, report_json)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(service, service_date) DO UPDATE SET
+                month=excluded.month,
+                year=excluded.year,
+                report_json=excluded.report_json
+        """, (service, service_date, month, year, payload))
+        self.conn.commit()
+
+    def load_service_reports(self):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT report_json FROM service_reports ORDER BY service_date, service")
+        result = []
+        for row in cursor.fetchall():
+            try:
+                result.append(json.loads(row[0]))
+            except Exception:
+                continue
+        return result
+
+    def delete_service_report(self, service, service_date):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "DELETE FROM service_reports WHERE service = ? AND service_date = ?",
+            (service, service_date)
+        )
+        self.conn.commit()
+
     def close(self):
         self.conn.close()
 
@@ -256,6 +375,7 @@ class MinistryScheduler:
         self.gladi_events = []
         self.trainees = []
         self.schedule_data = {}
+        self.service_reports = []
         self.gladi_event_counter = 0
 
         self.base_loads = {
@@ -1297,6 +1417,31 @@ class MinistryScheduler:
         return buffer.getvalue()
 
     # --------------------------------------------------------
+    # Service Report
+    # --------------------------------------------------------
+    def save_service_report(self, report):
+        # DatabaseManager melakukan merge/additive pada volunteer untuk
+        # service + tanggal yang sama. Ambil kembali record hasil merge
+        # supaya tampilan aplikasi memakai data final yang tersimpan.
+        self.db.save_service_report(report)
+        saved_reports = self.db.load_service_reports()
+        self.service_reports = saved_reports
+        self.service_reports.sort(key=lambda r: (r.get('service_date', ''), r.get('service', '')))
+
+    def delete_service_report(self, service, service_date):
+        self.db.delete_service_report(service, service_date)
+        self.service_reports = [
+            r for r in self.service_reports
+            if not (r.get('service') == service and r.get('service_date') == service_date)
+        ]
+
+    def get_service_reports_for_month(self, month_name, year):
+        return [
+            r for r in self.service_reports
+            if r.get('month') == month_name and int(r.get('year', 0)) == int(year)
+        ]
+
+    # --------------------------------------------------------
     # Save / recall
     # --------------------------------------------------------
     def save_current_state_to_db(self):
@@ -1333,6 +1478,7 @@ class MinistryScheduler:
         if trainees:
             self.trainees = trainees
             self.sync_trainees_into_groups()
+        self.service_reports = self.db.load_service_reports()
         schedule_data = self.db.load_schedule()
         if schedule_data:
             self.month_combo = schedule_data['month']
@@ -1359,6 +1505,9 @@ class MinistryScheduler:
 def init_state():
     if 'scheduler' not in st.session_state:
         st.session_state.scheduler = MinistryScheduler()
+        # Service Report is loaded automatically because each report is persisted
+        # in SQLite independently from the existing manual Recall workflow.
+        st.session_state.scheduler.service_reports = st.session_state.scheduler.db.load_service_reports()
         st.session_state.active_tab = 0
         st.session_state.setup_members = {
             g: ", ".join(v['members']) for g, v in st.session_state.scheduler.groups.items()
@@ -1375,6 +1524,8 @@ def init_state():
         st.session_state.override_pending = None
         st.session_state.additional_people = []
         st.session_state.schedule_generated = False
+        st.session_state.service_report_export_requested = False
+        st.session_state.service_report_confirmed = False
         st.session_state.recall_done = False
         st.session_state.exit_requested = False
         st.session_state.logged_out = False
@@ -1643,7 +1794,8 @@ tab_names = [
     "4. Special Service",
     "5. Gladi Events",
     "6. Manual Assignment",
-    "7. Generate & Export"
+    "7. Service Report",
+    "8. Generate & Export"
 ]
 with st.sidebar:
     st.markdown("## ⛪ Data Ministry")
@@ -1682,6 +1834,493 @@ with st.sidebar:
                 st.session_state.logged_out = True
                 st.rerun()
     st.caption("Gunakan browser tablet. Semua perubahan widget tersimpan pada session saat halaman aktif.")
+
+# ============================================================
+# SERVICE REPORT HELPERS
+# ============================================================
+# Daftar seluruh departemen volunteer yang dapat dipilih sebagai tambahan.
+# Daftar ini bersifat global agar setiap jenis ibadah dapat menambahkan departemen
+# yang sewaktu-waktu muncul tanpa mengubah konfigurasi utama ibadah.
+ALL_SERVICE_REPORT_VOLUNTEER_DEPARTMENTS = [
+    "PAW", "Pendoa", "Multimedia", "Usher", "S-Pro", "Sosmed",
+    "Sound", "DM", "CM", "Kakak EK Voltage", "MUA", "FLC", "Venue",
+    "WHL", "Hospitality", "MRI"
+]
+
+SERVICE_REPORT_CONFIG = {
+    "Voltage": {
+        "attendance_fields": [
+            ("adult", "Jemaat orang tua/dewasa"),
+            ("children", "Jemaat anak"),
+            ("child_volunteer", "Volunteer anak"),
+            ("new_souls", "Jiwa Baru"),
+            ("altar_call", "Altarcall"),
+            ("baptism", "Baptisan"),
+        ],
+        "volunteer_fields": [
+            "PAW", "Pendoa", "Multimedia", "Usher", "S-Pro", "Sosmed", "Sound", "DM", "Kakak EK Voltage"
+        ],
+        "volunteer_notes": "Volunteer anak dapat diberi keterangan nama pada catatan volunteer.",
+    },
+    "Teens": {
+        "attendance_fields": [
+            ("attendance", "Kehadiran jemaat saja"),
+            ("new_souls", "Jiwa Baru"),
+            ("altar_call", "Altarcall"),
+            ("baptism", "Baptisan"),
+        ],
+        "volunteer_fields": [
+            "PAW", "Pendoa", "Multimedia", "Usher", "S-Pro", "Sosmed", "Sound", "DM", "MUA", "FLC", "Venue", "WHL", "Hospitality", "MRI"
+        ],
+    },
+    "Youth": {
+        "attendance_fields": [
+            ("attendance", "Kehadiran jemaat saja"),
+            ("new_souls", "Jiwa Baru"),
+            ("altar_call", "Altarcall"),
+            ("baptism", "Baptisan"),
+        ],
+        "volunteer_fields": [
+            "PAW", "Pendoa", "Multimedia", "Usher", "S-Pro", "Sosmed", "Sound", "DM", "MUA", "FLC", "WHL"
+        ],
+    },
+    "Umum 1": {
+        "attendance_fields": [
+            ("attendance", "Kehadiran jemaat"),
+            ("new_souls", "Jiwa Baru"),
+            ("altar_call", "Altarcall"),
+            ("baptism", "Baptisan"),
+        ],
+        "volunteer_fields": [
+            "PAW", "Pendoa", "Multimedia", "Usher", "S-Pro", "Sosmed", "Sound", "DM", "Venue", "FLC", "WHL", "MRI", "Hospitality", "MUA"
+        ],
+    },
+    "Umum 2": {
+        "attendance_fields": [
+            ("attendance", "Kehadiran jemaat"),
+            ("new_souls", "Jiwa Baru"),
+            ("altar_call", "Altarcall"),
+            ("baptism", "Baptisan"),
+        ],
+        "volunteer_fields": [
+            "PAW", "Pendoa", "Multimedia", "Usher", "S-Pro", "Sosmed", "Sound", "DM", "Venue", "FLC", "WHL", "MRI", "Hospitality", "MUA"
+        ],
+    },
+    "Umum 3": {
+        "attendance_fields": [
+            ("attendance", "Kehadiran jemaat"),
+            ("new_souls", "Jiwa Baru"),
+            ("altar_call", "Altarcall"),
+            ("baptism", "Baptisan"),
+        ],
+        "volunteer_fields": [
+            "PAW", "Pendoa", "Multimedia", "Usher", "S-Pro", "Sosmed", "Sound", "DM", "Venue", "FLC", "WHL", "MRI", "Hospitality", "MUA"
+        ],
+    },
+}
+
+
+def _service_report_number(label, key, value=0):
+    return int(st.number_input(label, min_value=0, value=int(value or 0), step=1, key=key))
+
+
+def _report_month_from_date(d):
+    return MONTHS[d.month - 1]
+
+
+def _format_report_date(iso_date):
+    try:
+        return scheduler.get_indonesian_date(date.fromisoformat(iso_date))
+    except Exception:
+        return iso_date
+
+
+def _service_report_total_attendance(report):
+    attendance = int(report.get('attendance_total', 0))
+    pastor = int(report.get('pastor_count', 0))
+    speaker = int(report.get('speaker_count', 0))
+    fulltimer = int(report.get('fulltimer', 0))
+    total_volunteers = int(report.get('total_volunteers', 0))
+    # Total Kehadiran Keseluruhan =
+    # Kehadiran Jemaat Saja + Gembala + Pembicara + Fulltimer + Total Volunteer.
+    return attendance + pastor + speaker + fulltimer + total_volunteers
+
+
+def _service_report_volunteer_total(volunteers):
+    return sum(int(v or 0) for v in volunteers.values())
+
+
+def _render_service_report_preview(report):
+    st.markdown(f"### {report['service']} — {_format_report_date(report['service_date'])}")
+    st.write(f"**Pembicara:** {report.get('speaker_name') or '-'}")
+    st.write(
+        f"**Kehadiran jemaat saja:** {report.get('attendance_total', 0)} | "
+        f"**Jiwa Baru:** {report.get('new_souls', 0)} | "
+        f"**Altarcall:** {report.get('altar_call', 0)} | "
+        f"**Baptisan:** {report.get('baptism', 0)}"
+    )
+    st.write(
+        f"**Gembala:** {report.get('pastor_count', 0)} | "
+        f"**Pembicara:** {report.get('speaker_count', 0)} | "
+        f"**Fulltimer:** {report.get('fulltimer', 0)} | "
+        f"**Total Volunteers:** {report.get('total_volunteers', 0)} | "
+        f"**Total Kehadiran Keseluruhan:** {_service_report_total_attendance(report)}"
+    )
+    if report.get('service') == 'Voltage':
+        st.write(
+            f"**Dewasa:** {report.get('adult', 0)} | **Anak:** {report.get('children', 0)} | "
+            f"**Volunteer anak:** {report.get('child_volunteer', 0)}"
+        )
+    pc = report.get('prayer_corner', [])
+    st.write(f"**Prayer Corner:** {sum(int(x.get('count', 0)) for x in pc)} orang")
+    if pc:
+        st.dataframe(
+            [{"Nama": x.get('name', ''), "Jumlah": x.get('count', 0), "Gender": x.get('gender', '')} for x in pc],
+            use_container_width=True,
+            hide_index=True,
+        )
+    with st.expander("Rincian Volunteer", expanded=False):
+        st.dataframe(
+            [{"Volunteer": k, "Jumlah": v} for k, v in report.get('volunteers', {}).items()],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+def _build_service_report_excel_bytes(reports, month_name, year):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Service Report"
+    header_font = XlFont(bold=True, size=14)
+    title_font = XlFont(bold=True, size=18)
+    center = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    left = Alignment(horizontal='left', vertical='center', wrap_text=True)
+    thin = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+    yellow = PatternFill(start_color="FFE699", end_color="FFE699", fill_type="solid")
+    blue = PatternFill(start_color="D9E2F3", end_color="D9E2F3", fill_type="solid")
+    green = PatternFill(start_color="D9EAD3", end_color="D9EAD3", fill_type="solid")
+
+    ws.merge_cells('A1:D1')
+    ws['A1'] = "SERVICE REPORT GMS SALATIGA"
+    ws['A1'].font = title_font
+    ws['A1'].alignment = center
+    ws.merge_cells('A2:D2')
+    ws['A2'] = f"REKAP SERVICE REPORT BULAN {month_name.upper()} {year}"
+    ws['A2'].font = header_font
+    ws['A2'].alignment = center
+    current_row = 4
+
+    ordered_services = ["Voltage", "Teens", "Youth", "Umum 1", "Umum 2", "Umum 3"]
+    for service in ordered_services:
+        service_reports = sorted(
+            [r for r in reports if r.get('service') == service],
+            key=lambda x: x.get('service_date', '')
+        )
+        if not service_reports:
+            continue
+        ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=4)
+        c = ws.cell(current_row, 1, f"IBADAH {service.upper()}")
+        c.font = header_font; c.fill = yellow; c.alignment = center
+        current_row += 1
+        for report in service_reports:
+            ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=4)
+            c = ws.cell(current_row, 1, _format_report_date(report['service_date']))
+            c.font = XlFont(bold=True); c.fill = blue; c.alignment = center
+            current_row += 1
+            rows = [
+                ("Kehadiran Jemaat Saja", report.get('attendance_total', 0)),
+            ]
+            if service == 'Voltage':
+                rows.extend([
+                    ("Jemaat orang tua/dewasa", report.get('adult', 0)),
+                    ("Jemaat anak", report.get('children', 0)),
+                    ("Volunteer anak", report.get('child_volunteer', 0)),
+                ])
+            rows.extend([
+                ("Jiwa Baru", report.get('new_souls', 0)),
+                ("Altarcall", report.get('altar_call', 0)),
+                ("Baptisan", report.get('baptism', 0)),
+                ("Gembala", report.get('pastor_count', 0)),
+                ("Pembicara", report.get('speaker_count', 0)),
+                ("Fulltimer", report.get('fulltimer', 0)),
+                ("Nama Pembicara", report.get('speaker_name') or '-'),
+            ])
+            for label, value in rows:
+                ws.cell(current_row, 1, label).border = thin
+                ws.cell(current_row, 1).alignment = left
+                ws.cell(current_row, 2, value).border = thin
+                ws.cell(current_row, 2).alignment = center
+                ws.merge_cells(start_row=current_row, start_column=2, end_row=current_row, end_column=4)
+                current_row += 1
+            ws.cell(current_row, 1, "Volunteer").font = XlFont(bold=True); ws.cell(current_row, 1).fill = green
+            ws.cell(current_row, 1).border = thin
+            current_row += 1
+            for name, value in report.get('volunteers', {}).items():
+                ws.cell(current_row, 1, name).border = thin
+                ws.cell(current_row, 2, int(value or 0)).border = thin
+                ws.merge_cells(start_row=current_row, start_column=2, end_row=current_row, end_column=4)
+                current_row += 1
+            ws.cell(current_row, 1, "Total Volunteers").font = XlFont(bold=True); ws.cell(current_row, 1).border = thin
+            ws.cell(current_row, 2, report.get('total_volunteers', 0)).font = XlFont(bold=True); ws.cell(current_row, 2).border = thin
+            ws.merge_cells(start_row=current_row, start_column=2, end_row=current_row, end_column=4)
+            current_row += 1
+            ws.cell(current_row, 1, "Total Kehadiran Keseluruhan").font = XlFont(bold=True); ws.cell(current_row, 1).border = thin
+            ws.cell(current_row, 2, _service_report_total_attendance(report)).font = XlFont(bold=True); ws.cell(current_row, 2).border = thin
+            ws.merge_cells(start_row=current_row, start_column=2, end_row=current_row, end_column=4)
+            current_row += 1
+            ws.cell(current_row, 1, "Prayer Corner").font = XlFont(bold=True); ws.cell(current_row, 1).border = thin
+            current_row += 1
+            pc = report.get('prayer_corner', [])
+            if pc:
+                for person in pc:
+                    ws.cell(current_row, 1, person.get('name', '')).border = thin
+                    ws.cell(current_row, 2, int(person.get('count', 0))).border = thin
+                    ws.cell(current_row, 3, person.get('gender', '')).border = thin
+                    ws.cell(current_row, 4, '').border = thin
+                    current_row += 1
+            else:
+                ws.cell(current_row, 1, '-').border = thin
+                current_row += 1
+            current_row += 1
+
+    for col, width in {'A': 30, 'B': 20, 'C': 18, 'D': 18}.items():
+        ws.column_dimensions[col].width = width
+
+    # Monthly recap sheet.
+    recap = wb.create_sheet("Rekap Bulanan")
+    recap.merge_cells('A1:G1')
+    recap['A1'] = f"REKAP TOTAL SERVICE REPORT - {month_name.upper()} {year}"
+    recap['A1'].font = title_font; recap['A1'].alignment = center
+    headers = ["IBADAH", "JUMLAH ENTRY", "KEHADIRAN JEMAAT SAJA", "GEMBALA", "PEMBICARA", "FULLTIMER", "TOTAL KEHADIRAN", "JIWA BARU", "ALTARCALL", "BAPTISAN", "PRAYER CORNER"]
+    for col, h in enumerate(headers, 1):
+        cell = recap.cell(3, col, h); cell.font = header_font; cell.fill = yellow; cell.border = thin; cell.alignment = center
+    r = 4
+    grand = {k: 0 for k in ['attendance_total','pastor_count','speaker_count','fulltimer','total_attendance','new_souls','altar_call','baptism','prayer_corner']}
+    for service in ordered_services:
+        service_reports = [x for x in reports if x.get('service') == service]
+        vals = {
+            'attendance_total': sum(int(x.get('attendance_total',0)) for x in service_reports),
+            'pastor_count': sum(int(x.get('pastor_count',0)) for x in service_reports),
+            'speaker_count': sum(int(x.get('speaker_count',0)) for x in service_reports),
+            'fulltimer': sum(int(x.get('fulltimer',0)) for x in service_reports),
+            'total_attendance': sum(_service_report_total_attendance(x) for x in service_reports),
+            'new_souls': sum(int(x.get('new_souls',0)) for x in service_reports),
+            'altar_call': sum(int(x.get('altar_call',0)) for x in service_reports),
+            'baptism': sum(int(x.get('baptism',0)) for x in service_reports),
+            'prayer_corner': sum(sum(int(p.get('count',0)) for p in x.get('prayer_corner',[])) for x in service_reports),
+        }
+        for k in grand: grand[k] += vals[k]
+        row = [service, len(service_reports), vals['attendance_total'], vals['pastor_count'], vals['speaker_count'], vals['fulltimer'], vals['total_attendance'], vals['new_souls'], vals['altar_call'], vals['baptism'], vals['prayer_corner']]
+        for col, value in enumerate(row,1):
+            cell=recap.cell(r,col,value); cell.border=thin; cell.alignment=center
+        r += 1
+    row = ["TOTAL BULANAN", sum(1 for _ in reports), grand['attendance_total'], grand['pastor_count'], grand['speaker_count'], grand['fulltimer'], grand['total_attendance'], grand['new_souls'], grand['altar_call'], grand['baptism'], grand['prayer_corner']]
+    for col,value in enumerate(row,1):
+        cell=recap.cell(r,col,value); cell.border=thin; cell.font=XlFont(bold=True); cell.alignment=center
+    for col,width in {'A':22,'B':15,'C':24,'D':12,'E':14,'F':12,'G':18,'H':15,'I':15,'J':15,'K':18}.items(): recap.column_dimensions[col].width=width
+    return_bytes = io.BytesIO()
+    wb.save(return_bytes)
+    return_bytes.seek(0)
+    return return_bytes.getvalue()
+
+
+def _service_report_form():
+    st.subheader("Input Service Report")
+    services = list(SERVICE_REPORT_CONFIG.keys())
+    selected_service = st.selectbox("Pilih Ibadah", services, key="sr_service")
+    service_date = st.date_input("Tanggal Ibadah", value=date.today(), key="sr_date")
+    cfg = SERVICE_REPORT_CONFIG[selected_service]
+
+    # Jika laporan untuk ibadah + tanggal yang sama sudah tersimpan,
+    # tampilkan jumlah volunteer TERAKHIR sebagai nilai awal form. Dengan cara
+    # ini revisi S-Pro dari 4 menjadi 5 berarti total S-Pro menjadi 5, sehingga
+    # hanya ada penambahan 1 orang. Departemen lama lainnya tetap muncul.
+    existing_report = next(
+        (r for r in scheduler.service_reports
+         if r.get('service') == selected_service
+         and r.get('service_date') == service_date.isoformat()),
+        None
+    )
+    existing_volunteers = (existing_report or {}).get('volunteers', {}) or {}
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        pastor_count = _service_report_number("Gembala", "sr_pastor")
+    with c2:
+        speaker_count = _service_report_number("Pembicara", "sr_speaker_count")
+    with c3:
+        fulltimer = _service_report_number("Fulltimer", "sr_fulltimer")
+    speaker_name = st.text_input("Gembala/Pembicara — Nama Pembicara", key="sr_speaker_name")
+
+    st.markdown("#### Kehadiran")
+    attendance_values = {}
+    cols = st.columns(3)
+    for i, (field, label) in enumerate(cfg['attendance_fields']):
+        with cols[i % 3]:
+            attendance_values[field] = _service_report_number(label, f"sr_{field}")
+
+    if selected_service == 'Voltage':
+        attendance_total = (
+            attendance_values.get('adult', 0) +
+            attendance_values.get('children', 0) +
+            attendance_values.get('child_volunteer', 0)
+        )
+        st.info(f"Kehadiran jemaat saja otomatis: {attendance_total} orang")
+    else:
+        attendance_total = attendance_values.get('attendance', 0)
+
+    st.markdown("#### Volunteer")
+    st.caption("Catatan revisi: angka volunteer pada form adalah jumlah TERKINI per departemen. Jika S-Pro sebelumnya 4 lalu diubah menjadi 5, total S-Pro menjadi 5 (bertambah 1). Departemen lama lainnya tetap tersimpan.")
+    volunteers = {}
+    vol_cols = st.columns(3)
+    for i, role in enumerate(cfg['volunteer_fields']):
+        with vol_cols[i % 3]:
+            volunteers[role] = _service_report_number(
+                role,
+                f"sr_vol_{role}",
+                existing_volunteers.get(role, 0)
+            )
+
+    # Tambahan departemen bersifat opsional. Departemen tambahan yang sudah
+    # pernah tersimpan ikut dipilih kembali agar tidak hilang saat revisi.
+    # Departemen baru tetap dapat dipilih dari daftar global.
+    existing_additional_departments = [
+        dept for dept, count in existing_volunteers.items()
+        if dept not in cfg['volunteer_fields'] and int(count or 0) != 0
+    ]
+    available_additional_departments = list(dict.fromkeys(
+        existing_additional_departments + [
+            dept for dept in ALL_SERVICE_REPORT_VOLUNTEER_DEPARTMENTS
+            if dept not in cfg['volunteer_fields']
+        ]
+    ))
+    additional_departments = st.multiselect(
+        "Tambah Departemen Volunteer (opsional)",
+        options=available_additional_departments,
+        default=existing_additional_departments,
+        help="Pilih departemen tambahan apabila pada ibadah ini ada volunteer dari departemen yang tidak tercantum pada daftar bawaan.",
+        key="sr_additional_departments"
+    )
+
+    if additional_departments:
+        st.caption("Masukkan jumlah volunteer untuk departemen tambahan yang dipilih.")
+        additional_cols = st.columns(3)
+        for i, role in enumerate(additional_departments):
+            with additional_cols[i % 3]:
+                volunteers[role] = _service_report_number(
+                    role,
+                    f"sr_vol_additional_{role}",
+                    existing_volunteers.get(role, 0)
+                )
+
+    total_volunteers = _service_report_volunteer_total(volunteers)
+    st.info(f"Total Volunteers otomatis: {total_volunteers} orang")
+
+    st.markdown("#### Prayer Corner")
+    prayer_count = st.number_input("Jumlah baris Prayer Corner", min_value=0, max_value=50, value=0, step=1, key="sr_prayer_rows")
+    prayer_corner = []
+    for i in range(int(prayer_count)):
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            name = st.text_input("Nama", key=f"sr_pc_name_{i}")
+        with c2:
+            count = _service_report_number("Jumlah didoakan", f"sr_pc_count_{i}")
+        with c3:
+            gender = st.selectbox("Gender", ["Cewek", "Cowok"], key=f"sr_pc_gender_{i}")
+        if name.strip() or count:
+            prayer_corner.append({'name': name.strip(), 'count': count, 'gender': gender})
+
+    # Total kehadiran keseluruhan = jemaat + gembala + pembicara + fulltimer + volunteer.
+    total_attendance = attendance_total + pastor_count + speaker_count + fulltimer + total_volunteers
+    st.success(
+        f"Total Kehadiran Keseluruhan otomatis: {total_attendance} orang "
+        f"(Jemaat {attendance_total} + Gembala {pastor_count} + Pembicara {speaker_count} + Fulltimer {fulltimer} + Volunteer {total_volunteers})"
+    )
+
+    if st.button("💾 Simpan Service Report", type="primary", use_container_width=True):
+        report = {
+            'service': selected_service,
+            'service_date': service_date.isoformat(),
+            'month': _report_month_from_date(service_date),
+            'year': service_date.year,
+            **attendance_values,
+            'attendance_total': attendance_total,
+            'pastor_count': pastor_count,
+            'speaker_count': speaker_count,
+            'fulltimer': fulltimer,
+            'speaker_name': speaker_name.strip(),
+            'volunteers': volunteers,
+            'total_volunteers': total_volunteers,
+            'total_attendance': total_attendance,
+            'prayer_corner': prayer_corner,
+        }
+        scheduler.save_service_report(report)
+        st.session_state.service_report_confirmed = False
+        st.success(f"Service Report {selected_service} tanggal {scheduler.get_indonesian_date(service_date)} berhasil disimpan ke database.")
+        st.rerun()
+
+
+def _service_report_preview_month():
+    month_name = st.selectbox("Bulan Rekap", MONTHS, index=MONTHS.index(scheduler.month_combo), key="sr_month_preview")
+    year = st.number_input("Tahun", min_value=2000, max_value=2100, value=int(scheduler.year_spin), step=1, key="sr_year_preview")
+    reports = scheduler.get_service_reports_for_month(month_name, int(year))
+    expected_weeks = calculate_num_weeks(month_name, int(year))
+    st.info(f"Kalender bulan {month_name} {int(year)} memiliki {expected_weeks} minggu ibadah (berdasarkan jumlah hari Sabtu).")
+    if not reports:
+        st.warning("Belum ada Service Report untuk bulan tersebut.")
+        return
+
+    st.markdown("### Preview sebelum export")
+    for report in reports:
+        _render_service_report_preview(report)
+    st.markdown("### Rekap Total Bulanan")
+    summary = []
+    for service in SERVICE_REPORT_CONFIG:
+        items = [x for x in reports if x.get('service') == service]
+        summary.append({
+            'Ibadah': service,
+            'Entry': len(items),
+            'Kehadiran Jemaat Saja': sum(int(x.get('attendance_total',0)) for x in items),
+            'Gembala': sum(int(x.get('pastor_count',0)) for x in items),
+            'Pembicara': sum(int(x.get('speaker_count',0)) for x in items),
+            'Fulltimer': sum(int(x.get('fulltimer',0)) for x in items),
+            'Total Kehadiran': sum(_service_report_total_attendance(x) for x in items),
+            'Jiwa Baru': sum(int(x.get('new_souls',0)) for x in items),
+            'Altarcall': sum(int(x.get('altar_call',0)) for x in items),
+            'Baptisan': sum(int(x.get('baptism',0)) for x in items),
+            'Prayer Corner': sum(sum(int(p.get('count',0)) for p in x.get('prayer_corner',[])) for x in items),
+        })
+    import pandas as pd
+    st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
+    if st.button("📊 Export Rekap Service Report ke Excel", type="primary", use_container_width=True):
+        st.session_state.service_report_export_requested = True
+    if st.session_state.get('service_report_export_requested', False):
+        st.warning("Pastikan preview di atas sudah benar. Setelah dikonfirmasi, file Excel akan dibuat.")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("❌ Belum Benar / Kembali ke Input", key="sr_cancel_export", use_container_width=True):
+                st.session_state.service_report_export_requested = False
+                st.session_state.sr_mode = "📝 Input Report"
+                rerun()
+        with c2:
+            if st.button("✅ Ya, Data Sudah Benar", key="sr_confirm_export", type="primary", use_container_width=True):
+                try:
+                    data = _build_service_report_excel_bytes(reports, month_name, int(year))
+                    filename = f"Service_Report_GMS_Salatiga_{month_name}_{int(year)}.xlsx"
+                    st.download_button(
+                        "⬇️ Download Excel Service Report",
+                        data=data,
+                        file_name=filename,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        key="sr_download_excel",
+                    )
+                    st.session_state.service_report_export_requested = False
+                    st.success("Service Report berhasil dibuat dan siap di-download.")
+                except Exception as e:
+                    st.error(f"Export Service Report error: {e}")
+
+
 
 # ============================================================
 # TAB 1 - SETUP GROUP PIC
@@ -2339,10 +2978,73 @@ elif st.session_state.active_tab == 5:
             rerun()
 
 # ============================================================
-# TAB 7 - GENERATE & EXPORT
+# TAB 7 - SERVICE REPORT
 # ============================================================
 elif st.session_state.active_tab == 6:
-    st.header("7. Generate & Export")
+    st.header("7. Service Report")
+    st.caption("Input laporan mingguan, simpan permanen ke SQLite, preview, lalu export rekap bulanan ke Excel.")
+    sr_mode = st.radio(
+        "Menu Service Report",
+        ["📝 Input Report", "📊 Preview & Export"],
+        horizontal=True,
+        key="sr_mode"
+    )
+    if sr_mode == "📝 Input Report":
+        _service_report_form()
+    else:
+        _service_report_preview_month()
+    if scheduler.service_reports:
+        st.divider()
+        st.subheader("Data Service Report Tersimpan")
+        import pandas as pd
+        saved_rows = []
+        for r in scheduler.service_reports:
+            saved_rows.append({
+                'Ibadah': r.get('service'),
+                'Tanggal': _format_report_date(r.get('service_date','')),
+                'Kehadiran Jemaat Saja': r.get('attendance_total',0),
+                'Gembala': r.get('pastor_count',0),
+                'Pembicara': r.get('speaker_count',0),
+                'Fulltimer': r.get('fulltimer',0),
+                'Total Kehadiran': _service_report_total_attendance(r),
+                'Jiwa Baru': r.get('new_souls',0),
+                'Altarcall': r.get('altar_call',0),
+                'Baptisan': r.get('baptism',0),
+                'Total Volunteer': r.get('total_volunteers',0),
+                'Total Prayer': sum(int(p.get('count', 0)) for p in r.get('prayer_corner', [])),
+            })
+        st.dataframe(pd.DataFrame(saved_rows), use_container_width=True, hide_index=True)
+        delete_options = [
+            f"{r.get('service')} — {_format_report_date(r.get('service_date',''))}"
+            for r in scheduler.service_reports
+        ]
+        selected_delete = st.multiselect("Pilih laporan untuk dihapus", delete_options, key="sr_delete_selection")
+        if st.button("🗑️ Hapus Service Report Terpilih", use_container_width=True):
+            # Ambil semua report yang dipilih SEBELUM melakukan penghapusan.
+            # delete_service_report() juga menghapus item dari
+            # scheduler.service_reports, sehingga mencari index dari list yang
+            # sudah berubah dapat menyebabkan IndexError jika lebih dari satu
+            # report dihapus sekaligus.
+            selected_reports = []
+            for label in selected_delete:
+                idx = delete_options.index(label)
+                if 0 <= idx < len(scheduler.service_reports):
+                    selected_reports.append(scheduler.service_reports[idx])
+
+            for report in selected_reports:
+                scheduler.delete_service_report(
+                    report.get('service'),
+                    report.get('service_date')
+                )
+
+            st.success(f"{len(selected_reports)} laporan berhasil dihapus.")
+            rerun()
+
+# ============================================================
+# TAB 8 - GENERATE & EXPORT
+# ============================================================
+elif st.session_state.active_tab == 7:
+    st.header("8. Generate & Export")
     ensure_week_dates()
     if not scheduler.schedule_data:
         st.info("Please verify all data before generating the schedule.")
