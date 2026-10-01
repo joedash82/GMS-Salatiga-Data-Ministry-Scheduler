@@ -13,10 +13,9 @@ from openpyxl.styles import Alignment, Font as XlFont, Border, Side, PatternFill
 # GMS SALATIGA - DATA MINISTRY SCHEDULER
 # Streamlit Web Version
 # ============================================================
-
 st.set_page_config(
     page_title="GMS Salatiga - Data Ministry Scheduler",
-    page_icon="⛪",
+    page_icon="",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -245,32 +244,19 @@ class DatabaseManager:
         month = report['month']
         year = int(report['year'])
 
-        # ------------------------------------------------------------
-        # Service Report bersifat ADDITIVE untuk data VOLUNTEER.
-        # Jika laporan pada ibadah + tanggal yang sama sudah ada, data
-        # volunteer lama TIDAK dihapus. Jumlah dari input terbaru
-        # dianggap sebagai tambahan volunteer dan dijumlahkan ke data lama.
-        # Departemen baru juga otomatis ditambahkan ke dictionary lama.
-        # ------------------------------------------------------------
         cursor.execute(
             "SELECT report_json FROM service_reports WHERE service = ? AND service_date = ?",
             (service, service_date)
         )
         existing_row = cursor.fetchone()
-
         if existing_row:
             try:
                 existing_report = json.loads(existing_row[0])
             except (TypeError, json.JSONDecodeError):
                 existing_report = {}
-
             old_volunteers = existing_report.get('volunteers', {}) or {}
             new_volunteers = report.get('volunteers', {}) or {}
 
-            # Pada revisi, angka yang terlihat di form adalah TOTAL TERKINI
-            # per departemen, bukan angka tambahan. Contoh: data lama S-Pro=4
-            # lalu user mengubah form menjadi 5, hasil akhir harus 5 (bertambah 1),
-            # bukan 9. Departemen lama yang tidak disentuh tetap dipertahankan.
             merged_volunteers = dict(old_volunteers)
             for dept, new_count in new_volunteers.items():
                 try:
@@ -279,34 +265,21 @@ class DatabaseManager:
                     current_count = 0
                 merged_volunteers[dept] = current_count
 
-            # Hapus departemen yang secara eksplisit dikoreksi menjadi 0, tetapi
-            # jangan menghapus departemen lama yang tidak dikirim oleh form.
             merged_volunteers = {
                 dept: int(count or 0) for dept, count in merged_volunteers.items()
                 if int(count or 0) != 0
             }
 
-            # Total volunteer dihitung dari data final semua departemen.
             merged_total_volunteers = sum(
                 int(v or 0) for v in merged_volunteers.values()
             )
 
-            # Revisi Service Report harus memperbarui DATA TERKINI secara penuh.
-            # Data lama tetap menjadi dasar, tetapi field yang dikirim dari form
-            # (attendance, gembala, pembicara, fulltimer, speaker_name, prayer
-            # corner, dan field laporan lainnya) harus mengikuti input terbaru.
-            # Untuk volunteer, gunakan jumlah TERKINI per departemen hasil form,
-            # bukan menjumlahkan ulang angka lama dengan angka baru.
             merged_report = dict(existing_report)
             merged_report.update(report)
             merged_report['volunteers'] = merged_volunteers
             merged_report['total_volunteers'] = merged_total_volunteers
-
-            # Total kehadiran keseluruhan selalu dihitung ulang dari DATA TERKINI:
-            # Kehadiran Jemaat Saja + Gembala + Pembicara + Fulltimer + Total Volunteer.
             merged_report['total_attendance'] = _service_report_total_attendance(merged_report)
 
-            # Metadata mengikuti laporan yang sedang disimpan.
             merged_report['service'] = service
             merged_report['service_date'] = service_date
             merged_report['month'] = month
@@ -316,12 +289,12 @@ class DatabaseManager:
         payload = json.dumps(report, ensure_ascii=False)
         cursor.execute("""
             INSERT INTO service_reports
-                (service, service_date, month, year, report_json)
+            (service, service_date, month, year, report_json)
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(service, service_date) DO UPDATE SET
-                month=excluded.month,
-                year=excluded.year,
-                report_json=excluded.report_json
+            month=excluded.month,
+            year=excluded.year,
+            report_json=excluded.report_json
         """, (service, service_date, month, year, payload))
         self.conn.commit()
 
@@ -346,7 +319,6 @@ class DatabaseManager:
 
     def close(self):
         self.conn.close()
-
 
 # ============================================================
 # CORE / APPLICATION STATE
@@ -377,7 +349,6 @@ class MinistryScheduler:
         self.schedule_data = {}
         self.service_reports = []
         self.gladi_event_counter = 0
-
         self.base_loads = {
             "Johanes": 4, "Andree": 4, "Pipik": 5, "Yessi": 5,
             "Isel": 5, "Donny": 4, "Siska": 4, "Hartono": 4,
@@ -386,7 +357,6 @@ class MinistryScheduler:
         }
         self.max_loads_4_weeks = dict(self.base_loads)
         self.max_loads_5_weeks = dict(self.base_loads)
-
         self.teams = {
             'VOLTAGE': [
                 {'name': 'TIM 1', 'pic': 'Johanes', 'member': 'Calista'},
@@ -465,8 +435,8 @@ class MinistryScheduler:
         week_num = self.get_week_number_from_date(date_obj)
         if week_num is None:
             week_num = (date_obj.day - 1) // 7 + 1
-            if week_num > 5:
-                week_num = 5
+        if week_num > 5:
+            week_num = 5
         for absence in self.absences:
             if person_name == absence['name'] and week_num in absence.get('weeks', []):
                 return True
@@ -561,7 +531,7 @@ class MinistryScheduler:
             group = trainee['group']
             if group in self.groups and name not in self.groups[group]['members']:
                 self.groups[group]['members'].append(name)
-            self.all_names.add(name)
+                self.all_names.add(name)
 
     def add_new_member(self, name, group, trainings, month, service, finished):
         name = name.strip().title()
@@ -577,13 +547,15 @@ class MinistryScheduler:
                     return False, f"{name} is already registered as a trainee for {service} in {month}."
         if name in self.all_names and name not in self.groups[group]['members'] and not any(t['name'] == name for t in self.trainees):
             return False, f"{name} already exists in another group."
+
         if finished:
             if name not in self.groups[group]['members']:
                 self.groups[group]['members'].append(name)
-            self.all_names.add(name)
-            self.max_loads_4_weeks[name] = 4
-            self.max_loads_5_weeks[name] = 5
+                self.all_names.add(name)
+                self.max_loads_4_weeks[name] = 4
+                self.max_loads_5_weeks[name] = 5
             return True, f"{name} added to {group} group."
+
         if name not in self.groups[group]['members']:
             self.groups[group]['members'].append(name)
         self.trainees.append({
@@ -836,7 +808,6 @@ class MinistryScheduler:
                 raise ValueError("Please complete Setup first.")
             num_weeks = 4 if self.weeks_combo == 4 else 5
             max_loads = self.max_loads_5_weeks if num_weeks == 5 else self.max_loads_4_weeks
-
             current_loads = defaultdict(int)
             for name in self.all_names:
                 current_loads[name] = 0
@@ -852,7 +823,6 @@ class MinistryScheduler:
                 'July', 'August', 'September', 'October', 'November', 'December'
             ].index(self.month_combo)
             calendar_rotation = self.year_spin * 12 + month_idx
-
             team_usage = {
                 group: {idx: 0 for idx in range(len(self.teams.get(group, [])))}
                 for group in self.teams
@@ -955,7 +925,6 @@ class MinistryScheduler:
                                 ratio = projected_load / max(cap, 1)
                                 max_ratio = max(max_ratio, ratio)
                                 total_ratio += ratio
-
                             team_count = max(len(self.teams.get(group_name, [])), 1)
                             rotation = tuple(
                                 (idx - (calendar_rotation + week + service_pos)) % team_count
@@ -1006,6 +975,7 @@ class MinistryScheduler:
                     if orig_mems:
                         _mem_rot = calendar_rotation % len(orig_mems)
                         orig_mems = orig_mems[_mem_rot:] + orig_mems[:_mem_rot]
+
                     override_pic = next(
                         (o['person'] for o in self.manual_overrides
                          if o['week'] == week and o['service'] == svc and o['role'] == 'PIC'),
@@ -1200,6 +1170,7 @@ class MinistryScheduler:
                         trainee_counts[assigned_mem] += 1
                     if assigned_pic in trainee_counts:
                         trainee_counts[assigned_pic] += 1
+
                     self.schedule_data[week][svc] = {
                         'pic': assigned_pic,
                         'member': assigned_mem
@@ -1239,7 +1210,7 @@ class MinistryScheduler:
                 )
             return True, None
         except Exception as e:
-            return False, f"An error occurred:\n{str(e)}\n\nDetails:\n{traceback.format_exc()}"
+            return False, f"An error occurred:\n{str(e)}\nDetails:\n{traceback.format_exc()}"
 
     # --------------------------------------------------------
     # Excel export
@@ -1249,7 +1220,6 @@ class MinistryScheduler:
             raise ValueError("Please generate first.")
         if not self.week_date_inputs:
             raise ValueError("Please set week dates first.")
-        
         wb = Workbook()
         ws = wb.active
         ws.title = "Jadwal DM"
@@ -1266,6 +1236,7 @@ class MinistryScheduler:
         green_fill = PatternFill(start_color="D9EAD3", end_color="D9EAD3", fill_type="solid")
         cyan_fill = PatternFill(start_color="00FFFF", end_color="00FFFF", fill_type="solid")
         gold_fill = PatternFill(start_color="FFD700", end_color="FFD700", fill_type="solid")
+
         ws.merge_cells('A1:G1')
         ws['A1'] = "JADWAL PELAYANAN DATA MINISTRY GMS SALATIGA"
         ws['A1'].font = title_font
@@ -1274,6 +1245,7 @@ class MinistryScheduler:
         ws['A2'] = f"BULAN {self.month_combo.upper()} {self.year_spin}"
         ws['A2'].font = header_font
         ws['A2'].alignment = center_align
+
         headers = [
             "IBADAH", "VOLTAGE\n(13.00)", "TEENS\n(16.00)", "YOUTH\n(18.30)",
             "UMUM 1\n(07.00)", "UMUM 2\n(09.30)", "UMUM 3\n(17.00)"
@@ -1284,23 +1256,17 @@ class MinistryScheduler:
             cell.alignment = center_align
             cell.border = thin_border
             cell.fill = yellow_fill
-            
+
         current_row = 5
-        
-        # CRITICAL FIX: Use week_date_inputs as authoritative source for number of weeks
         num_weeks = len(self.week_date_inputs)
-        
         for w in range(1, num_weeks + 1):
-            # Skip if this week doesn't exist in schedule_data
             if w not in self.schedule_data:
                 continue
-                
             date_index = w - 1
             sat_date, sun_date = self.week_date_inputs[date_index]
-                
             sat_date_str = self.get_indonesian_date(sat_date)
             sun_date_str = self.get_indonesian_date(sun_date)
-            
+
             ws.cell(row=current_row, column=1, value="TANGGAL").border = thin_border
             ws.cell(row=current_row, column=1).fill = blue_fill
             ws.cell(row=current_row, column=1).font = XlFont(bold=True)
@@ -1315,6 +1281,7 @@ class MinistryScheduler:
             ws.cell(row=current_row, column=5, value=sun_date_str).border = thin_border
             ws.cell(row=current_row, column=5).fill = green_fill
             current_row += 1
+
             ws.cell(row=current_row, column=1, value="Volunteer").border = thin_border
             for col, svc in enumerate(self.services, 2):
                 assignment = self.schedule_data[w][svc]
@@ -1339,16 +1306,18 @@ class MinistryScheduler:
                     cell.fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
                     cell.font = XlFont(color="FFFFFF")
             current_row += 1
+
             ws.cell(row=current_row, column=1, value="Link Tally dan Seat Counter").border = thin_border
             for col in range(2, 8):
                 ws.cell(row=current_row, column=col, value="").border = thin_border
             current_row += 2
-            
+
         ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=7)
         ws.cell(row=current_row, column=1, value="IBADAH TENGAH MINGGU").font = header_font
         ws.cell(row=current_row, column=1).fill = cyan_fill
         ws.cell(row=current_row, column=1).alignment = center_align
         current_row += 1
+
         if self.special_services:
             for ss in self.special_services:
                 ws.cell(row=current_row, column=1, value=ss['date']).border = thin_border
@@ -1371,6 +1340,7 @@ class MinistryScheduler:
                 ws.cell(row=current_row, column=1, value="Link Tally dan Seat Counter").border = thin_border
                 ws.cell(row=current_row, column=2, value="").border = thin_border
                 current_row += 2
+
         if self.gladi_events:
             ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=7)
             ws.cell(row=current_row, column=1, value="JADWAL GLADI BERSIH & KOTOR").font = header_font
@@ -1393,6 +1363,7 @@ class MinistryScheduler:
                 ws.cell(row=current_row, column=2).font = XlFont(bold=True, size=14)
                 ws.cell(row=current_row, column=2).alignment = left_align
                 current_row += 2
+
         ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=7)
         ws.cell(row=current_row, column=1, value="Keterangan :").font = header_font
         current_row += 1
@@ -1408,6 +1379,7 @@ class MinistryScheduler:
             ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=7)
             ws.cell(row=current_row, column=1, value=note).alignment = left_align
             current_row += 1
+
         ws.column_dimensions['A'].width = 20
         for col in ['B', 'C', 'D', 'E', 'F', 'G']:
             ws.column_dimensions[col].width = 25
@@ -1420,9 +1392,6 @@ class MinistryScheduler:
     # Service Report
     # --------------------------------------------------------
     def save_service_report(self, report):
-        # DatabaseManager melakukan merge/additive pada volunteer untuk
-        # service + tanggal yang sama. Ambil kembali record hasil merge
-        # supaya tampilan aplikasi memakai data final yang tersimpan.
         self.db.save_service_report(report)
         saved_reports = self.db.load_service_reports()
         self.service_reports = saved_reports
@@ -1467,7 +1436,7 @@ class MinistryScheduler:
         groups = self.db.load_setup()
         if groups:
             self.groups = groups
-        self.update_combo_boxes()
+            self.update_combo_boxes()
         absences = self.db.load_absences()
         if absences:
             self.absences = absences
@@ -1498,39 +1467,35 @@ class MinistryScheduler:
                 self.week_date_inputs = restored
         return True
 
-
 # ============================================================
 # SESSION STATE
 # ============================================================
 def init_state():
     if 'scheduler' not in st.session_state:
         st.session_state.scheduler = MinistryScheduler()
-        # Service Report is loaded automatically because each report is persisted
-        # in SQLite independently from the existing manual Recall workflow.
-        st.session_state.scheduler.service_reports = st.session_state.scheduler.db.load_service_reports()
-        st.session_state.active_tab = 0
-        st.session_state.setup_members = {
-            g: ", ".join(v['members']) for g, v in st.session_state.scheduler.groups.items()
-        }
-        st.session_state.setup_pics = {
-            g: ", ".join(v['pics']) for g, v in st.session_state.scheduler.groups.items()
-        }
-        st.session_state.setup_widget_version = 0
-        st.session_state.abs_selected_weeks = []
-        st.session_state.abs_replacement_mode = "Same replacement person"
-        st.session_state.abs_multiple_replacements = []
-        st.session_state.gladi_pending = None
-        st.session_state.ss_pending = None
-        st.session_state.override_pending = None
-        st.session_state.additional_people = []
-        st.session_state.schedule_generated = False
-        st.session_state.service_report_export_requested = False
-        st.session_state.service_report_confirmed = False
-        st.session_state.recall_done = False
-        st.session_state.exit_requested = False
-        st.session_state.logged_out = False
+    st.session_state.scheduler.service_reports = st.session_state.scheduler.db.load_service_reports()
+    st.session_state.active_tab = 0
+    st.session_state.setup_members = {
+        g: ", ".join(v['members']) for g, v in st.session_state.scheduler.groups.items()
+    }
+    st.session_state.setup_pics = {
+        g: ", ".join(v['pics']) for g, v in st.session_state.scheduler.groups.items()
+    }
+    st.session_state.setup_widget_version = 0
+    st.session_state.abs_selected_weeks = []
+    st.session_state.abs_replacement_mode = "Same replacement person"
+    st.session_state.abs_multiple_replacements = []
+    st.session_state.gladi_pending = None
+    st.session_state.ss_pending = None
+    st.session_state.override_pending = None
+    st.session_state.additional_people = []
+    st.session_state.schedule_generated = False
+    st.session_state.setdefault('service_report_export_requested', False)
+    st.session_state.service_report_confirmed = False
+    st.session_state.recall_done = False
+    st.session_state.setdefault('exit_requested', False)
+    st.session_state.setdefault('logged_out', False)
     return st.session_state.scheduler
-
 
 scheduler = init_state()
 
@@ -1539,26 +1504,26 @@ scheduler = init_state()
 # ============================================================
 if st.session_state.get("logged_out", False):
     st.markdown("""
-<div style="
-    max-width: 620px;
-    margin: 90px auto 20px auto;
-    padding: 42px 30px;
-    text-align: center;
-    background: #ffffff;
-    border: 1px solid #e5e7eb;
-    border-radius: 18px;
-    box-shadow: 0 8px 30px rgba(0,0,0,0.08);
-">
-    <div style="font-size: 52px; margin-bottom: 12px;">✅</div>
-    <h1 style="margin-bottom: 10px;">Anda telah keluar</h1>
-    <p style="font-size: 17px; color: #6b7280; margin-bottom: 0;">
-        Sesi aplikasi Data Ministry Scheduler telah dihentikan.
-    </p>
-    <p style="font-size: 15px; color: #9ca3af; margin-top: 8px;">
-        Anda dapat menutup tab browser ini secara manual.
-    </p>
-</div>
-""", unsafe_allow_html=True)
+    <div style="
+        max-width: 620px;
+        margin: 90px auto 20px auto;
+        padding: 42px 30px;
+        text-align: center;
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 18px;
+        box-shadow: 0 8px 30px rgba(0,0,0,0.08);
+    ">
+        <div style="font-size: 52px; margin-bottom: 12px;">✅</div>
+        <h1 style="margin-bottom: 10px;">Anda telah keluar</h1>
+        <p style="font-size: 17px; color: #6b7280; margin-bottom: 0;">
+            Sesi aplikasi Data Ministry Scheduler telah dihentikan.
+        </p>
+        <p style="font-size: 15px; color: #9ca3af; margin-top: 8px;">
+            Anda dapat menutup tab browser ini secara manual.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
     if st.button("🔄 Kembali ke Aplikasi", type="primary", use_container_width=True):
         st.session_state.logged_out = False
         st.session_state.exit_requested = False
@@ -1576,10 +1541,8 @@ GROUPS = ["VOLTAGE", "AOG", "UMUM"]
 SERVICES = scheduler.services
 NAMES = sorted(scheduler.all_names)
 
-
 def adjust_to_weekday(d, target_weekday):
     return d + timedelta(days=(target_weekday - d.weekday()) % 7)
-
 
 def calculate_num_weeks(month_name, year):
     month = MONTHS.index(month_name) + 1
@@ -1591,69 +1554,50 @@ def calculate_num_weeks(month_name, year):
         return 5
     return 4
 
-
 def ensure_week_dates():
     num_weeks = scheduler.weeks_combo
     current = date.today()
-
-    # Keep existing dates when the number of weeks is reduced (e.g. 5 -> 4).
-    # This prevents stale Week 5 data from causing an index error.
     if scheduler.week_date_inputs:
         if len(scheduler.week_date_inputs) >= num_weeks:
             scheduler.week_date_inputs = scheduler.week_date_inputs[:num_weeks]
             return
-
-        # If more weeks are needed, extend the existing list instead of
-        # replacing the dates that the user has already selected.
         last_sat, last_sun = scheduler.week_date_inputs[-1]
         for _ in range(num_weeks - len(scheduler.week_date_inputs)):
             last_sat += timedelta(days=7)
             last_sun += timedelta(days=7)
             scheduler.week_date_inputs.append((last_sat, last_sun))
         return
-
     first_sat = adjust_to_weekday(current, 5)
     scheduler.week_date_inputs = [
         (first_sat + timedelta(days=7 * i), first_sat + timedelta(days=7 * i + 1))
         for i in range(num_weeks)
     ]
 
-
 def rerun():
     st.rerun()
-
 
 def show_schedule_html():
     if not scheduler.schedule_data:
         st.info("Belum ada jadwal. Klik Generate Schedule Preview terlebih dahulu.")
         return
-    
-    # CRITICAL FIX: Use week_date_inputs as authoritative source for number of weeks
     if not scheduler.week_date_inputs:
         st.info("Belum ada data tanggal minggu. Silakan atur di tab Regular Service.")
         return
-    
     rows = []
     headers = [
         "IBADAH", "VOLTAGE (13.00)", "TEENS (16.00)", "YOUTH (18.30)",
         "UMUM 1 (07.00)", "UMUM 2 (09.30)", "UMUM 3 (17.00)"
     ]
     rows.append("<tr>" + "".join(f"<th>{h}</th>" for h in headers) + "</tr>")
-    
-    # Use only weeks that have both schedule data and corresponding dates.
-    # This protects against stale schedule data when switching from 5 weeks to 4.
     schedule_weeks = [w for w in scheduler.schedule_data if isinstance(w, int)]
     num_weeks = min(len(scheduler.week_date_inputs), max(schedule_weeks, default=0))
-    
     for w in range(1, num_weeks + 1):
         if w not in scheduler.schedule_data:
             continue
-        
         date_index = w - 1
         if date_index >= len(scheduler.week_date_inputs):
             continue
         sat, sun = scheduler.week_date_inputs[date_index]
-                
         rows.append(
             f"<tr><td><b>TANGGAL</b></td>"
             f"<td colspan='3' class='schedule-date-sat'>{scheduler.get_indonesian_date(sat)}</td>"
@@ -1680,7 +1624,7 @@ def show_schedule_html():
         rows.append("<tr><td><b>Volunteer</b></td>" + "".join(volunteer_cells) + "</tr>")
         rows.append("<tr><td><b>Link Tally dan Seat Counter</b></td><td colspan='6'></td></tr>")
         rows.append("<tr><td colspan='7' style='height:8px;border:none'></td></tr>")
-        
+
     rows.append("<tr><td colspan='7' class='schedule-midweek'>IBADAH TENGAH MINGGU</td></tr>")
     for ss in scheduler.special_services:
         rows.append(f"<tr><td>{ss['date']}</td><td colspan='6'><b>{ss['event']}</b></td></tr>")
@@ -1691,7 +1635,6 @@ def show_schedule_html():
             rows.append(f"<tr><td></td><td colspan='6'>{', '.join(additional)}</td></tr>")
         rows.append("<tr><td><b>Link Tally dan Seat Counter</b></td><td colspan='6'></td></tr>")
         rows.append("<tr><td colspan='7' style='height:8px;border:none'></td></tr>")
-        
     if scheduler.gladi_events:
         rows.append("<tr><td colspan='7' class='schedule-gladi'>JADWAL GLADI BERSIH & KOTOR</td></tr>")
         grouped = defaultdict(list)
@@ -1701,8 +1644,7 @@ def show_schedule_html():
             times_str = ", ".join(sorted(times)) if len(times) > 1 else times[0]
             label = "Times" if len(times) > 1 else "Time"
             rows.append(f"<tr><td>{d}</td><td colspan='6'><b>{desc} ({event_type}) - {label}: {times_str}</b></td></tr>")
-            rows.append("<tr><td colspan='7' style='height:8px;border:none'></td></tr>")
-            
+        rows.append("<tr><td colspan='7' style='height:8px;border:none'></td></tr>")
     notes = [
         "1. Yang belum punya seragam pakai kemeja & celana hitam, pakai ID Card, wanita harap memakai makeup dan pria rambut rapi, pakai parfum dan HT",
         "2. Datang 1 jam sebelum ibadah, ikut briefing dan berdoa bersama, mengingatkan semua pelayanan utk Absensi di GMS Church",
@@ -1714,10 +1656,8 @@ def show_schedule_html():
     rows.append("<tr><td colspan='7'><b>Keterangan :</b></td></tr>")
     for note in notes:
         rows.append(f"<tr><td colspan='7' class='schedule-note'>{note}</td></tr>")
-        
     html = "<table class='schedule-table'>" + "".join(rows) + "</table>"
     st.markdown(html, unsafe_allow_html=True)
-
 
 def absence_table():
     if not scheduler.absences:
@@ -1737,7 +1677,6 @@ def absence_table():
     ])
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-
 def gladi_table():
     if not scheduler.gladi_events:
         st.info("Belum ada Gladi Event.")
@@ -1748,7 +1687,6 @@ def gladi_table():
         for e in scheduler.gladi_events
     ])
     st.dataframe(df, use_container_width=True, hide_index=True)
-
 
 def special_table():
     if not scheduler.special_services:
@@ -1765,7 +1703,6 @@ def special_table():
     ])
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-
 def override_table():
     if not scheduler.manual_overrides:
         st.info("Belum ada manual assignment.")
@@ -1776,7 +1713,6 @@ def override_table():
         for o in scheduler.manual_overrides
     ])
     st.dataframe(df, use_container_width=True, hide_index=True)
-
 
 # ============================================================
 # HEADER
@@ -1838,15 +1774,11 @@ with st.sidebar:
 # ============================================================
 # SERVICE REPORT HELPERS
 # ============================================================
-# Daftar seluruh departemen volunteer yang dapat dipilih sebagai tambahan.
-# Daftar ini bersifat global agar setiap jenis ibadah dapat menambahkan departemen
-# yang sewaktu-waktu muncul tanpa mengubah konfigurasi utama ibadah.
 ALL_SERVICE_REPORT_VOLUNTEER_DEPARTMENTS = [
     "PAW", "Pendoa", "Multimedia", "Usher", "S-Pro", "Sosmed",
     "Sound", "DM", "CM", "Kakak EK Voltage", "MUA", "FLC", "Venue",
     "WHL", "Hospitality", "MRI"
 ]
-
 SERVICE_REPORT_CONFIG = {
     "Voltage": {
         "attendance_fields": [
@@ -1860,7 +1792,6 @@ SERVICE_REPORT_CONFIG = {
         "volunteer_fields": [
             "PAW", "Pendoa", "Multimedia", "Usher", "S-Pro", "Sosmed", "Sound", "DM", "Kakak EK Voltage"
         ],
-        "volunteer_notes": "Volunteer anak dapat diberi keterangan nama pada catatan volunteer.",
     },
     "Teens": {
         "attendance_fields": [
@@ -1919,14 +1850,11 @@ SERVICE_REPORT_CONFIG = {
     },
 }
 
-
 def _service_report_number(label, key, value=0):
     return int(st.number_input(label, min_value=0, value=int(value or 0), step=1, key=key))
 
-
 def _report_month_from_date(d):
     return MONTHS[d.month - 1]
-
 
 def _format_report_date(iso_date):
     try:
@@ -1934,21 +1862,16 @@ def _format_report_date(iso_date):
     except Exception:
         return iso_date
 
-
 def _service_report_total_attendance(report):
     attendance = int(report.get('attendance_total', 0))
     pastor = int(report.get('pastor_count', 0))
     speaker = int(report.get('speaker_count', 0))
     fulltimer = int(report.get('fulltimer', 0))
     total_volunteers = int(report.get('total_volunteers', 0))
-    # Total Kehadiran Keseluruhan =
-    # Kehadiran Jemaat Saja + Gembala + Pembicara + Fulltimer + Total Volunteer.
     return attendance + pastor + speaker + fulltimer + total_volunteers
-
 
 def _service_report_volunteer_total(volunteers):
     return sum(int(v or 0) for v in volunteers.values())
-
 
 def _render_service_report_preview(report):
     st.markdown(f"### {report['service']} — {_format_report_date(report['service_date'])}")
@@ -1986,7 +1909,6 @@ def _render_service_report_preview(report):
             hide_index=True,
         )
 
-
 def _build_service_report_excel_bytes(reports, month_name, year):
     wb = Workbook()
     ws = wb.active
@@ -2010,12 +1932,18 @@ def _build_service_report_excel_bytes(reports, month_name, year):
     ws['A2'].alignment = center
     current_row = 4
 
+    # Group reports dynamically
+    grouped_reports = defaultdict(list)
+    for r in reports:
+        grouped_reports[r.get('service')].append(r)
+        
+    # Order: Regular services first, then Special Services
     ordered_services = ["Voltage", "Teens", "Youth", "Umum 1", "Umum 2", "Umum 3"]
-    for service in ordered_services:
-        service_reports = sorted(
-            [r for r in reports if r.get('service') == service],
-            key=lambda x: x.get('service_date', '')
-        )
+    special_services = [s for s in grouped_reports.keys() if s not in ordered_services]
+    final_service_order = [s for s in ordered_services if s in grouped_reports] + special_services
+    
+    for service in final_service_order:
+        service_reports = sorted(grouped_reports[service], key=lambda x: x.get('service_date', ''))
         if not service_reports:
             continue
         ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=4)
@@ -2082,10 +2010,9 @@ def _build_service_report_excel_bytes(reports, month_name, year):
                 ws.cell(current_row, 1, '-').border = thin
                 current_row += 1
             current_row += 1
-
     for col, width in {'A': 30, 'B': 20, 'C': 18, 'D': 18}.items():
         ws.column_dimensions[col].width = width
-
+        
     # Monthly recap sheet.
     recap = wb.create_sheet("Rekap Bulanan")
     recap.merge_cells('A1:G1')
@@ -2096,8 +2023,8 @@ def _build_service_report_excel_bytes(reports, month_name, year):
         cell = recap.cell(3, col, h); cell.font = header_font; cell.fill = yellow; cell.border = thin; cell.alignment = center
     r = 4
     grand = {k: 0 for k in ['attendance_total','pastor_count','speaker_count','fulltimer','total_attendance','new_souls','altar_call','baptism','prayer_corner']}
-    for service in ordered_services:
-        service_reports = [x for x in reports if x.get('service') == service]
+    for service in final_service_order:
+        service_reports = grouped_reports[service]
         vals = {
             'attendance_total': sum(int(x.get('attendance_total',0)) for x in service_reports),
             'pastor_count': sum(int(x.get('pastor_count',0)) for x in service_reports),
@@ -2122,27 +2049,34 @@ def _build_service_report_excel_bytes(reports, month_name, year):
     wb.save(return_bytes)
     return_bytes.seek(0)
     return return_bytes.getvalue()
-
+    return return_bytes.getvalue()
 
 def _service_report_form():
     st.subheader("Input Service Report")
-    services = list(SERVICE_REPORT_CONFIG.keys())
+    # Added "Special Service" to the list
+    services = list(SERVICE_REPORT_CONFIG.keys()) + ["Special Service"]
     selected_service = st.selectbox("Pilih Ibadah", services, key="sr_service")
-    service_date = st.date_input("Tanggal Ibadah", value=date.today(), key="sr_date")
-    cfg = SERVICE_REPORT_CONFIG[selected_service]
+    
+    special_service_name = ""
+    if selected_service == "Special Service":
+        special_service_name = st.text_input("Nama Special Service", key="sr_special_service_name")
 
-    # Jika laporan untuk ibadah + tanggal yang sama sudah tersimpan,
-    # tampilkan jumlah volunteer TERAKHIR sebagai nilai awal form. Dengan cara
-    # ini revisi S-Pro dari 4 menjadi 5 berarti total S-Pro menjadi 5, sehingga
-    # hanya ada penambahan 1 orang. Departemen lama lainnya tetap muncul.
+    service_date = st.date_input("Tanggal Ibadah", value=date.today(), key="sr_date")
+    
+    # Define config for Special Service to prevent KeyError
+    if selected_service == "Special Service":
+        cfg = SERVICE_REPORT_CONFIG["Umum 1"]
+    else:
+        cfg = SERVICE_REPORT_CONFIG[selected_service]
+
     existing_report = next(
         (r for r in scheduler.service_reports
-         if r.get('service') == selected_service
+         if r.get('service') == (special_service_name.strip() if selected_service == "Special Service" else selected_service)
          and r.get('service_date') == service_date.isoformat()),
         None
     )
     existing_volunteers = (existing_report or {}).get('volunteers', {}) or {}
-
+    
     c1, c2, c3 = st.columns(3)
     with c1:
         pastor_count = _service_report_number("Gembala", "sr_pastor")
@@ -2151,14 +2085,14 @@ def _service_report_form():
     with c3:
         fulltimer = _service_report_number("Fulltimer", "sr_fulltimer")
     speaker_name = st.text_input("Gembala/Pembicara — Nama Pembicara", key="sr_speaker_name")
-
+    
     st.markdown("#### Kehadiran")
     attendance_values = {}
     cols = st.columns(3)
     for i, (field, label) in enumerate(cfg['attendance_fields']):
         with cols[i % 3]:
             attendance_values[field] = _service_report_number(label, f"sr_{field}")
-
+            
     if selected_service == 'Voltage':
         attendance_total = (
             attendance_values.get('adult', 0) +
@@ -2168,7 +2102,7 @@ def _service_report_form():
         st.info(f"Kehadiran jemaat saja otomatis: {attendance_total} orang")
     else:
         attendance_total = attendance_values.get('attendance', 0)
-
+        
     st.markdown("#### Volunteer")
     st.caption("Catatan revisi: angka volunteer pada form adalah jumlah TERKINI per departemen. Jika S-Pro sebelumnya 4 lalu diubah menjadi 5, total S-Pro menjadi 5 (bertambah 1). Departemen lama lainnya tetap tersimpan.")
     volunteers = {}
@@ -2180,10 +2114,7 @@ def _service_report_form():
                 f"sr_vol_{role}",
                 existing_volunteers.get(role, 0)
             )
-
-    # Tambahan departemen bersifat opsional. Departemen tambahan yang sudah
-    # pernah tersimpan ikut dipilih kembali agar tidak hilang saat revisi.
-    # Departemen baru tetap dapat dipilih dari daftar global.
+            
     existing_additional_departments = [
         dept for dept, count in existing_volunteers.items()
         if dept not in cfg['volunteer_fields'] and int(count or 0) != 0
@@ -2201,7 +2132,6 @@ def _service_report_form():
         help="Pilih departemen tambahan apabila pada ibadah ini ada volunteer dari departemen yang tidak tercantum pada daftar bawaan.",
         key="sr_additional_departments"
     )
-
     if additional_departments:
         st.caption("Masukkan jumlah volunteer untuk departemen tambahan yang dipilih.")
         additional_cols = st.columns(3)
@@ -2212,10 +2142,10 @@ def _service_report_form():
                     f"sr_vol_additional_{role}",
                     existing_volunteers.get(role, 0)
                 )
-
+                
     total_volunteers = _service_report_volunteer_total(volunteers)
     st.info(f"Total Volunteers otomatis: {total_volunteers} orang")
-
+    
     st.markdown("#### Prayer Corner")
     prayer_count = st.number_input("Jumlah baris Prayer Corner", min_value=0, max_value=50, value=0, step=1, key="sr_prayer_rows")
     prayer_corner = []
@@ -2229,17 +2159,22 @@ def _service_report_form():
             gender = st.selectbox("Gender", ["Cewek", "Cowok"], key=f"sr_pc_gender_{i}")
         if name.strip() or count:
             prayer_corner.append({'name': name.strip(), 'count': count, 'gender': gender})
-
-    # Total kehadiran keseluruhan = jemaat + gembala + pembicara + fulltimer + volunteer.
+            
     total_attendance = attendance_total + pastor_count + speaker_count + fulltimer + total_volunteers
     st.success(
         f"Total Kehadiran Keseluruhan otomatis: {total_attendance} orang "
         f"(Jemaat {attendance_total} + Gembala {pastor_count} + Pembicara {speaker_count} + Fulltimer {fulltimer} + Volunteer {total_volunteers})"
     )
-
+    
     if st.button("💾 Simpan Service Report", type="primary", use_container_width=True):
+        if selected_service == "Special Service" and not special_service_name.strip():
+            st.error("Nama Special Service tidak boleh kosong.")
+            return
+            
+        service_name = special_service_name.strip() if selected_service == "Special Service" else selected_service
+        
         report = {
-            'service': selected_service,
+            'service': service_name,
             'service_date': service_date.isoformat(),
             'month': _report_month_from_date(service_date),
             'year': service_date.year,
@@ -2253,12 +2188,12 @@ def _service_report_form():
             'total_volunteers': total_volunteers,
             'total_attendance': total_attendance,
             'prayer_corner': prayer_corner,
+            'is_special_service': selected_service == "Special Service"
         }
         scheduler.save_service_report(report)
         st.session_state.service_report_confirmed = False
-        st.success(f"Service Report {selected_service} tanggal {scheduler.get_indonesian_date(service_date)} berhasil disimpan ke database.")
+        st.success(f"Service Report {service_name} tanggal {scheduler.get_indonesian_date(service_date)} berhasil disimpan ke database.")
         st.rerun()
-
 
 def _service_report_preview_month():
     month_name = st.selectbox("Bulan Rekap", MONTHS, index=MONTHS.index(scheduler.month_combo), key="sr_month_preview")
@@ -2269,14 +2204,18 @@ def _service_report_preview_month():
     if not reports:
         st.warning("Belum ada Service Report untuk bulan tersebut.")
         return
-
     st.markdown("### Preview sebelum export")
     for report in reports:
         _render_service_report_preview(report)
     st.markdown("### Rekap Total Bulanan")
     summary = []
-    for service in SERVICE_REPORT_CONFIG:
-        items = [x for x in reports if x.get('service') == service]
+    
+    # Group reports dynamically by actual service name
+    grouped_reports = defaultdict(list)
+    for r in reports:
+        grouped_reports[r.get('service')].append(r)
+        
+    for service, items in grouped_reports.items():
         summary.append({
             'Ibadah': service,
             'Entry': len(items),
@@ -2300,7 +2239,7 @@ def _service_report_preview_month():
         with c1:
             if st.button("❌ Belum Benar / Kembali ke Input", key="sr_cancel_export", use_container_width=True):
                 st.session_state.service_report_export_requested = False
-                st.session_state.sr_mode = "📝 Input Report"
+                st.session_state.sr_mode = " Input Report"
                 rerun()
         with c2:
             if st.button("✅ Ya, Data Sudah Benar", key="sr_confirm_export", type="primary", use_container_width=True):
@@ -2314,13 +2253,12 @@ def _service_report_preview_month():
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
                         key="sr_download_excel",
+                        on_click="ignore",
                     )
                     st.session_state.service_report_export_requested = False
                     st.success("Service Report berhasil dibuat dan siap di-download.")
                 except Exception as e:
                     st.error(f"Export Service Report error: {e}")
-
-
 
 # ============================================================
 # TAB 1 - SETUP GROUP PIC
@@ -2353,7 +2291,6 @@ if st.session_state.active_tab == 0:
                 st.rerun()
             else:
                 st.warning(msg)
-
     st.subheader("Group Configuration")
     for group_name in GROUPS:
         with st.container(border=True):
@@ -2373,11 +2310,9 @@ if st.session_state.active_tab == 0:
                     height=130,
                     key=f"pics_{group_name}_{st.session_state.setup_widget_version}"
                 )
-            
             members_from_textarea = [x.strip().title() for x in st.session_state.setup_members[group_name].replace(',', '\n').split('\n') if x.strip()]
             pics_from_textarea = [x.strip().title() for x in st.session_state.setup_pics[group_name].replace(',', '\n').split('\n') if x.strip()]
             scheduler.groups[group_name] = {'members': members_from_textarea, 'pics': pics_from_textarea}
-            
             group_members = scheduler.groups.get(group_name, {}).get('members', [])
             trainee_names_in_group = {
                 t['name'] for t in scheduler.trainees
@@ -2406,7 +2341,7 @@ if st.session_state.active_tab == 0:
                 if (st.session_state.get('member_delete_requested', False) and
                         st.session_state.get('member_delete_group') == group_name):
                     st.warning(
-                        "⚠️ Member yang dipilih akan dihapus dari daftar member dan PIC "
+                        "️ Member yang dipilih akan dihapus dari daftar member dan PIC "
                         "grup ini. Jadwal/history yang sudah tersimpan tidak akan dihapus. "
                         "Apakah Anda yakin?"
                     )
@@ -2449,7 +2384,6 @@ if st.session_state.active_tab == 0:
                                 f"Successfully deleted {deleted_count} active member(s) from {group_name} GROUP!"
                             )
                             st.rerun()
-
     st.subheader("Team Configuration & Preview")
     st.caption("Nama tim tidak boleh duplikat di dalam kelompok. Pilih PIC dan member dari daftar anggota yang sudah ada.")
     for group_name in GROUPS:
@@ -2482,8 +2416,7 @@ if st.session_state.active_tab == 0:
                 scheduler.teams[group_name] = revised
             import pandas as pd
             st.dataframe(pd.DataFrame([{t['name']: f"{t['pic']} (PIC)" if row == 0 else t['member'] for t in revised} for row in range(2)]), use_container_width=True, hide_index=True)
-
-    if st.button(" Save Setup & Map Services", type="primary", use_container_width=True):
+    if st.button("💾 Save Setup & Map Services", type="primary", use_container_width=True):
         groups = {}
         for g in GROUPS:
             members = [x.strip().title() for x in st.session_state.setup_members[g].replace(',', '\n').split('\n') if x.strip()]
@@ -2491,7 +2424,6 @@ if st.session_state.active_tab == 0:
             groups[g] = {'members': members, 'pics': pics}
         scheduler.save_setup(groups)
         st.success("Setup saved!")
-
     if scheduler.trainees:
         st.subheader("Registered Trainees")
         import pandas as pd
@@ -2505,7 +2437,7 @@ if st.session_state.active_tab == 0:
             trainee_labels,
             key="trainee_delete"
         )
-        if st.button("🗑️ Delete Selected Trainee", use_container_width=True):
+        if st.button("️ Delete Selected Trainee", use_container_width=True):
             if not selected_trainees:
                 st.warning("Please select at least one trainee record to delete.")
             else:
@@ -2585,7 +2517,7 @@ elif st.session_state.active_tab == 1:
     with c1:
         add_abs = st.button("➕ Add Absence", type="primary", use_container_width=True)
     with c2:
-        delete_abs = st.button("🗑️ Delete Selected", use_container_width=True)
+        delete_abs = st.button("️ Delete Selected", use_container_width=True)
     if add_abs:
         scheduler.month_combo = abs_month
         scheduler.year_spin = int(abs_year)
@@ -2696,9 +2628,9 @@ elif st.session_state.active_tab == 3:
     if st.session_state.get('ss_pending'):
         p = st.session_state.ss_pending
         st.warning(
-            f"A similar event already exists.\n\n"
-            f"Date: {p['existing']['date']}\n\nEvent: {p['existing']['event']}\n\n"
-            f"PIC: {p['existing']['pic']}\n\nMember: {p['existing']['member']}"
+            f"A similar event already exists.\n"
+            f"Date: {p['existing']['date']}\nEvent: {p['existing']['event']}\n"
+            f"PIC: {p['existing']['pic']}\nMember: {p['existing']['member']}"
         )
         c1, c2 = st.columns(2)
         with c1:
@@ -2716,7 +2648,7 @@ elif st.session_state.active_tab == 3:
         st.subheader("Delete Special Service")
         labels = [f"{i + 1}. {s['date']} — {s['event']} — {s['pic']} / {s['member']}" for i, s in enumerate(scheduler.special_services)]
         selected_delete = st.multiselect("Select event(s) to delete", labels, key="ss_delete")
-        if st.button("🗑️ Delete Selected Special Service", use_container_width=True):
+        if st.button("️ Delete Selected Special Service", use_container_width=True):
             indices = [labels.index(x) for x in selected_delete]
             for idx in sorted(indices, reverse=True):
                 del scheduler.special_services[idx]
@@ -2755,19 +2687,19 @@ elif st.session_state.active_tab == 4:
         with c2:
             gladi_time = st.text_input("Time", placeholder="e.g., 18.00 WIB", key="gladi_time")
             gladi_desc = st.text_input("Description", placeholder="e.g., AOG Sound and Bound", key="gladi_desc")
-        if st.button("➕ Add Gladi Event", type="primary", use_container_width=True):
-            d = scheduler.get_indonesian_date(gladi_date)
-            result, payload = scheduler.add_gladi_event(gladi_type, d, gladi_time.strip(), gladi_desc.strip())
-            if result == 'success':
-                st.success(payload)
-            elif result in ('duplicate', 'conflict', 'date_warning'):
-                st.session_state.gladi_pending = {
-                    'result': result, 'payload': payload,
-                    'type': gladi_type, 'date': d,
-                    'time': gladi_time.strip(), 'desc': gladi_desc.strip()
-                }
-            else:
-                st.warning(payload)
+    if st.button("➕ Add Gladi Event", type="primary", use_container_width=True):
+        d = scheduler.get_indonesian_date(gladi_date)
+        result, payload = scheduler.add_gladi_event(gladi_type, d, gladi_time.strip(), gladi_desc.strip())
+        if result == 'success':
+            st.success(payload)
+        elif result in ('duplicate', 'conflict', 'date_warning'):
+            st.session_state.gladi_pending = {
+                'result': result, 'payload': payload,
+                'type': gladi_type, 'date': d,
+                'time': gladi_time.strip(), 'desc': gladi_desc.strip()
+            }
+        else:
+            st.warning(payload)
     if st.session_state.get('gladi_pending'):
         p = st.session_state.gladi_pending
         payload = p['payload']
@@ -2792,7 +2724,7 @@ elif st.session_state.active_tab == 4:
             st.error("Gladi Bersih and Gladi Kotor cannot be on the same date!")
             c1, c2 = st.columns(2)
             with c1:
-                if st.button(" Cancel (Keep Existing)", key="gl_cancel2", use_container_width=True):
+                if st.button("❌ Cancel (Keep Existing)", key="gl_cancel2", use_container_width=True):
                     st.session_state.gladi_pending = None
                     rerun()
             with c2:
@@ -2821,7 +2753,7 @@ elif st.session_state.active_tab == 4:
     if scheduler.gladi_events:
         labels = [f"{i + 1}. {e['date']} — {e['description']} ({e['type']}) — {e['time']}" for i, e in enumerate(scheduler.gladi_events)]
         selected = st.multiselect("Select Gladi event(s) to delete", labels, key="gladi_delete")
-        if st.button("🗑️ Delete Selected Gladi Event", use_container_width=True):
+        if st.button("️ Delete Selected Gladi Event", use_container_width=True):
             indices = [labels.index(x) for x in selected]
             for idx in sorted(indices, reverse=True):
                 del scheduler.gladi_events[idx]
@@ -2859,21 +2791,21 @@ elif st.session_state.active_tab == 5:
         override_svc = st.selectbox("Service", SERVICES, key="override_svc")
     with c2:
         override_role = st.selectbox("Assignment Type", ["PIC", "Member", "Team"], key="override_role")
-    selected_group = scheduler.service_to_group.get(override_svc, "")
-    configured_teams = scheduler.teams.get(selected_group, []) if selected_group else []
-    team_options = [t.get('name', '').strip() for t in configured_teams if t.get('name', '').strip()]
-    if override_role == "Team":
-        override_team = st.selectbox(
-            f"Team ({selected_group})",
-            team_options if team_options else [""],
-            key="override_team"
-        )
-        override_person = ""
-    else:
-        override_person = st.selectbox(
-            "Person", names if names else [""], key="override_person"
-        )
-        override_team = ""
+        selected_group = scheduler.service_to_group.get(override_svc, "")
+        configured_teams = scheduler.teams.get(selected_group, []) if selected_group else []
+        team_options = [t.get('name', '').strip() for t in configured_teams if t.get('name', '').strip()]
+        if override_role == "Team":
+            override_team = st.selectbox(
+                f"Team ({selected_group})",
+                team_options if team_options else [""],
+                key="override_team"
+            )
+            override_person = ""
+        else:
+            override_person = st.selectbox(
+                "Person", names if names else [""], key="override_person"
+            )
+            override_team = ""
     if st.button("➕ Add Manual Assignment", type="primary", use_container_width=True):
         week = int(override_week)
         if override_role != "Team":
@@ -2970,7 +2902,7 @@ elif st.session_state.active_tab == 5:
     if scheduler.manual_overrides:
         labels = [f"{i + 1}. Week {o['week']} — {o['service']} — {o['role']} — {o['person']}" for i, o in enumerate(scheduler.manual_overrides)]
         selected = st.multiselect("Select manual assignment(s) to delete", labels, key="override_delete")
-        if st.button("🗑️ Delete Selected", use_container_width=True):
+        if st.button("️ Delete Selected", use_container_width=True):
             indices = [labels.index(x) for x in selected]
             for idx in sorted(indices, reverse=True):
                 del scheduler.manual_overrides[idx]
@@ -2985,11 +2917,11 @@ elif st.session_state.active_tab == 6:
     st.caption("Input laporan mingguan, simpan permanen ke SQLite, preview, lalu export rekap bulanan ke Excel.")
     sr_mode = st.radio(
         "Menu Service Report",
-        ["📝 Input Report", "📊 Preview & Export"],
+        [" Input Report", " Preview & Export"],
         horizontal=True,
         key="sr_mode"
     )
-    if sr_mode == "📝 Input Report":
+    if sr_mode == " Input Report":
         _service_report_form()
     else:
         _service_report_preview_month()
@@ -3020,23 +2952,16 @@ elif st.session_state.active_tab == 6:
         ]
         selected_delete = st.multiselect("Pilih laporan untuk dihapus", delete_options, key="sr_delete_selection")
         if st.button("🗑️ Hapus Service Report Terpilih", use_container_width=True):
-            # Ambil semua report yang dipilih SEBELUM melakukan penghapusan.
-            # delete_service_report() juga menghapus item dari
-            # scheduler.service_reports, sehingga mencari index dari list yang
-            # sudah berubah dapat menyebabkan IndexError jika lebih dari satu
-            # report dihapus sekaligus.
             selected_reports = []
             for label in selected_delete:
                 idx = delete_options.index(label)
                 if 0 <= idx < len(scheduler.service_reports):
                     selected_reports.append(scheduler.service_reports[idx])
-
             for report in selected_reports:
                 scheduler.delete_service_report(
                     report.get('service'),
                     report.get('service_date')
                 )
-
             st.success(f"{len(selected_reports)} laporan berhasil dihapus.")
             rerun()
 
@@ -3077,7 +3002,7 @@ elif st.session_state.active_tab == 7:
                     data = scheduler.export_to_excel_bytes()
                     filename = f"Jadwal_DM_GMS_Salatiga_{scheduler.month_combo}_{scheduler.year_spin}.xlsx"
                     st.download_button(
-                        "⬇️ Download Excel File",
+                        "️ Download Excel File",
                         data=data,
                         file_name=filename,
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -3089,7 +3014,3 @@ elif st.session_state.active_tab == 7:
                     st.error(f"Export error: {e}")
     st.subheader("Schedule Preview")
     show_schedule_html()
-
-# ============================================================
-# END
-# ============================================================
